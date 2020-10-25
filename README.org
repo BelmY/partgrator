@@ -1,0 +1,1124 @@
+* Index
+  - [[#Introduction][Introduction]]
+  - [[#IMPORTANT][IMPORTANT]]
+  - [[#Requisites][Requisites]]
+  - [[#Installer][Installer]]
+  - [[#Manual-Partgrator-Device-Creation][Manual Partgrator Device Creation]]
+  - [[#Multiple-Main-Partgrator-Partitions][Multiple Main Partgrator Partitions]]
+  - [[#User-scripts][User scripts]]
+  - [[#Customization][Customization]]
+  - [[#Known-issues-and-limitations][Known issues and limitations]]
+  - [[#Troubleshooting][Troubleshooting]]
+  - [[#How-it-works][How it works]]
+  - [[#Why-it-works][Why it works]]
+  - [[#Portability---Utilities-and-Builtins-used][Portability - Utilities and Builtins used]]
+  - [[#Code---Shell-tricks-and-Workarounds][Code - Shell tricks and Workarounds]]
+  - [[#Improvements-TO-DOs][Improvements (TO-DOs)]]
+  - [[#Changelog][Changelog]]
+  - [[#Author][Author]]
+  - [[#Copyright-and-License][Copyright and License]]
+
+* Introduction
+  Partgrator is a set of last-resort scripts with the goal of keeping partitions' filesystems corruption-free.
+
+  The name /partgrator/ is a portmanteau of /partition/ and /migrator/, alluding to the main procedure performed by the scripts.
+
+  The original idea is to work around ~e2fsck~ inability to fix corrupted filesystems that require ~manual intervention~.
+
+  ~Manual intervention~ means that the filesystem is having discrepancies (either early or late) in multiple of its [[https://www.kernel.org/doc/html/latest/filesystems/ext4/globals.html#super-block][superblocks]] at the same time, so that the automatic repair procedure doesn't have enough redundant information to make safe decisions. Even if nothing (files/directories) seems to be missing or corrupted (before and/or after ~manual intervention~), the best course of action is to start anew in a freshly formatted partition as soon as possible to prevent the corruption from extending.
+
+  Partgrator safely automates 100% of the data-migrating procedure by formatting a reserved partition (same size as the corrupted one) with exactly the same filesystem and attributes as the corrupted one, cloning the original data (preserving all attributes), and swapping the partitions' labels to allow the procedure to happen again in the future. Afterwards the partitions are reloaded so that the services/scripts that use them can restart using the freshly formatted partition with the old data as if nothing had happened.
+
+  Every part of the partgrator process (including errors and status codes returned) is logged into the system's log, as well into a dedicated logfile that gets automatically truncated to avoid using more space than necessary.
+
+  Note that, by default in case of an error during the migration (except being deliberately interrupted), partgrator won't prevent a corrupted partition from being mounted and used by other services as usual. This behavior can be changed by disabling the ~ignore~ [[#partgrator-helpers][variables]]. In any case, partgrator will try to perform the procedure again next time the partition is mounted.
+
+  Partgrator is highly [[#Customization][customizable]] to allow being adapted to every use case scenario.
+
+  For installing, check the [[#Requisites][Requisites]] and the [[#Installer][Installer]] sections.
+
+  See the [[#IMPORTANT][IMPORTANT]], [[#How-it-works][How it works]] and the [[#Why-it-works][Why it works]] sections for more information.
+
+* IMPORTANT
+  - *Partgrator is originally designed for [[https://www.asuswrt-merlin.net/][Asuswrt-Merlin]] routers (Busybox's ash). You may use it in any other system provided a POSIX shell is available (with [[#Busyboxs-ash-specific-1251---aarch64][some exceptions]]) and the [[#Portability---Utilities-and-Builtins-used][required tools]] are installed or implemented (alias or functions for the [[#System-specific-utilities][system specific tools]])*
+
+  - *Partgrator's target audience is users who reboot their system regularly (either intentionally or unintentionally) and/or have experienced data loss/malfunction of their device (USB) after booting up, even with disk repair utilities scheduled at boot*
+
+  - *Partgrator's intended usage is small flash drives or small partitions ([[#Manual-Partgrator-Device-Creation][manual configuration]] is required for custom size or [[#Multiple-Main-Partgrator-Partitions][multi-main partitions]]), otherwise the migration process may take a lot of time (depending on the amount of data to migrate)*
+
+  - *Partgrator's migrations don't prevent the data from corrupting, they only keep the partition's filesystem corruption-free (which in turn reduces the chances of data corruption) by moving the data from a corrupted filesystem into a freshly formatted one (see [[#Why-it-works][Why it works]]). You may use your own scripts to back up and restore the data to ensure its integrity, learn more [[#How-to-ensure-the-datas-integrity-with-your-own-script][here]].*
+
+  - *Partgrator's migrations are safe from data loss as the migration process has recovery mechanisms implemented to continue (and re-do the remaining operations) even if the system is powered off while partgrator is migrating (see [[#How-it-works][How it works]])*
+
+  - *Partgrator's scripts may delay the [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts][jffs-scripts]] execution (especially true if a migration is required) and/or execute them multiple times if the device needs to be reloaded*
+
+  - *Partgrator's devices must have unique labels for all their main partitions*
+
+  - *Partgrator's installer usb-creator wizard limits the device's (USB) available size to half its capacity. So an 8GB device will only have 4GB available afterwards. Do a [[#Manual-Partgrator-Device-Creation][manual configuration]] to customize partgrator's size*
+
+  - *Partgrator's installer usb-creator wizard is not safe from data loss (unlike the migration process) due to the fact the chosen device's data is temporarily stored in the RAM while it's being partitioned and formatted (see [[#Installer][Installer]]*)
+
+  - *Always back up your data (especially if it's important) before performing procedures that may result in its loss*
+
+* Requisites
+  - [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts][JFFS custom scripts]] enabled
+  - [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/USB-Disk-Check-at-Boot-or-Hot-Plug-(improved-version)][disk-check]]-like script (like the one available in [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/AMTM][amtm]]) executed on device (USB) detection ([[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#pre-mount][pre-mount]])
+  - Ability to unmount partgrator (including main) partitions (see [[#Partgrator-scripts-and-installer-is-unable-to-unmount-my-device-USB][troubleshooting]])
+
+* Installer
+  The ~partgrator-installer~ script is the one responsible for installing and uninstalling the scripts, as well as configuring a partgrator device (USB).
+
+  When executed interactively, ~partgrator-installer~ filters the user input (discarding everything typed before the last <Enter>) to prevent answering accidentally to the next prompt (still not displayed), check [[#Ignore-everything-typed-before-the-last-Enter-with-cat-and-awk][how the filtering works]]. On a pipe, ~partgrator-installer~ disables this behavior (and adds a ~--yes~ to the list of parameters) to allow automating any procedure:
+  #+begin_src sh
+    echo y | sh partgrator-installer install     # (Re)install automatically
+    echo y | sh partgrator-installer uninstall   # uninstall automatically
+
+    # Configure a device using the default options (it won't end if unable to unmount)
+    { printf '1\n\n1\n'; while :; do echo 1; done & } | sh partgrator-installer usb-creator | sed '/^sh: 1:/d'
+  #+end_src
+
+  You may change the input filtering feature by setting the variable ~$batch_mode~ to 0 or 1. Only useful for skipping the first banner in an interactive installation:
+  #+begin_src sh
+    # Choose the first device to install partgrator and accept the default label
+    { echo; cat; } | batch_mode=0 sh partgrator-installer usb-creator | ( trap '' EXIT KILL QUIT INT; cat; kill -s INT 0 )
+  #+end_src
+
+  Note that the ~usb-creator~ option runs by default some [[#User-scripts][user-scripts]], which may call some other services/scripts that may prevent the chosen device's partitions from being unmounted, even though it the opposite of the expected result. Check the [[#Partgrator-scripts-and-installer-is-unable-to-unmount-my-device-USB][troubleshoot]] section for solutions.
+
+  Once a device is chosen for installing partgrator, the installer gives the option to choose a partition to preserve its ext filesystem features, max mount count, check interval, errors behavior, mount options, and extended mount options (or copy them from another partition).
+
+  Learn more about the partgrator device structure in [[#Setup][How it works - Setup]].
+
+  Note that if any of the main partgrator partition's attributes (filesystem features, max mount count, check interval, errors behavior, mount options, and extended mount options) want to be modified (with ~tune2fs~ or ~debugfs~ if available), it is enough to change them in the main partgrator partition (read how it works in the [[#Migration][migration section]]). This behavior allows having more than one main partgrator partition with different filesystems (ext), filesystem features, max mount count, check interval, errors behavior, mount options, and extended mount options (this setup needs to be done [[#Manual-Partgrator-Device-Creation][manually]], it has not been extensively tested, and requires setting the ~experimental_partition_reprocess~ variable to 1).
+
+  When creating a partgrator device with the ~usb-creator~ wizard, the installer automatically backs up the device data in the system's RAM and restores it after the device is configured. This means that the device (USB) data will be lost if the system is powered off after the partitions have been formatted and the data restoring procedure has not been completed.
+
+  *Back up your device (USB) data before continuing with the installation*.
+
+  Note that if the ~usb-creator~ procedure is cancelled or interrupted before successfully configuring a device, the data that was temporarily stored into the RAM will be available when rerunning the ~usb-creator~ (if the user chooses to keep it), also the chosen device will be left in the same state it was when the interruption/cancellation happened. In the case the device's partitions were unmounted and you want to mount them back automatically without rebooting (along with all the other devices' partitions connected into the system) triggering the ~user-scripts~ (partially or completely depending if they are mounted or not) you may use the following command:
+  #+begin_src sh
+    udevtrigger --subsystem-match=block  # Doesn't show output without the --verbose flag
+  #+end_src
+
+  Also note that the ~usb-creator~ procedure may use all the available RAM in the system when attempting to temporarily store the content of the chosen device's partitions before partitioning and formatting them. There is a small chance that the installer is abruptly killed (due to the OOM killer, or not having even the small amount of RAM necessary for performing the procedure for freeing the temporary partitions ~.tar.gz~) while saving the data. See the [[#Out-of-RAM-when-creating-a-device-with-the-usb-creator-wizard][troubleshoot]] to learn how to work around the issue. You may remove the temporary files yourself with the following command:
+  #+begin_src sh
+    rm -rf /tmp/partgrator-tars  # Or whatever the variable $tmp_tars is set to
+  #+end_src
+
+** Usage
+   The usage information is showed whenever an unknown parameter is passed.
+
+   *Please note that the parameter parsing used is very loose, meaning that passing* /installation/ *instead of* /install/ *is still recognized as a valid* ~install~ *parameter*.
+
+  #+begin_src text
+    Usage: ./partgrator-installer [install|uninstall|usb-creator] [-y|--yes]
+
+           By default (no parameters) ./partgrator-installer performs 'install' followed by 'usb-creator'
+           Updates are automatically detected with 'install'
+           The optional -y/--yes flag skips the first prompt
+  #+end_src
+
+** Download scripts + Configure device - one-liner
+   You may even pass parameters to the installer by setting the ~$parameters~ value in the environment before running it.
+
+*** curl
+    #+begin_src sh
+      { echo '{ ('; curl -s -L 'https://github.com/caribpa/partgrator/raw/master/partgrator-installer'; sh -c 'echo "); kill -s INT $$ 2>/dev/null; }"; exec cat'; } | { batch_mode=0 sh 2>&1; } | ( trap '' EXIT KILL QUIT INT; exec cat >&2 )
+    #+end_src
+*** wget
+    #+begin_src sh
+      { echo '{ ('; wget -q -O - 'https://github.com/caribpa/partgrator/raw/master/partgrator-installer'; sh -c 'echo "); kill -s INT $$ 2>/dev/null; }"; exec cat'; } | { batch_mode=0 sh 2>&1; } | ( trap '' EXIT KILL QUIT INT; exec cat >&2 )
+    #+end_src
+
+** Install scripts + Configure device (after downloading the installer)
+   #+begin_src sh
+     sh partgrator-installer
+   #+end_src
+
+** Install scripts without asking for confirmation
+   #+begin_src sh
+     sh partgrator-installer install --yes
+   #+end_src
+
+** Configure a device without asking for the first confirmation
+   #+begin_src sh
+     sh partgrator-installer usb-creator -y
+   #+end_src
+
+** Uninstall partgrator scripts
+   #+begin_src sh
+     sh partgrator-installer uninstall
+   #+end_src
+
+* Manual Partgrator Device Creation
+  The main advantage of creating a partgrator-compatible device manually is being able to create more than one partition reserved for user data.
+
+  This is especially useful for installing partgrator in big devices that are also used as Media Servers, Samba/Cloud sharing, etc.
+
+  You can perform this procedure in any system with any disk/partition manager program that allows creating ext devices.
+
+  *Please always back up your important data before performing procedures like the following that will result in data loss*.
+
+  This example uses a 32GB USB device connected to an Asuswrt-Merlin router, in which three partitions are created:
+  - 2GB ext2 partition named /JFFS-scripts/
+  - 2GB ext2 partition named /_partgrator/
+  - 28GB ext4 partition named /Media-Server/
+
+  *Important: Every main partition in a device must have a unique label, duplicated labels are allowed for multiple _partgrator partitions but they will only be useful in the next [[https://github.com/caribpa/partgrator/issues/1][major release]]*.
+
+  The following commands are performed on the Asuswrt-Merlin terminal (busybox's ~ash~) over ssh:
+  #+begin_src sh
+    # First check if there are mounted partitions
+    grep sd /etc/mtab  # /dev/sda1 is mounted
+
+    # From now on, it is assumed that /dev/sda is the device we want to configure
+
+    # Unmount it (repeat with the path of the other mounted partitions, if needed)
+    umount /dev/sda1   # Try with -f if it fails and as a last resort with -l
+
+    # Start the partition manager util fdisk on the device using sectors (-u flag)
+    fdisk -u /dev/sda  # At any time press ? for help and q for exiting without saving
+
+    # List all the partitions in the device - Press Enter to perform the commands
+    p
+
+    # Delete the only exiting partition (partition 1) - Repeat with 2, 3, etc, if needed
+    d
+    1                  # fdisk won't ask for a number if only one partition is remaining
+
+    # Create the 2GB partition 1 (JFFS-scripts)
+    n
+    p                  # primary partition
+    1                  # partition 1
+    <Enter>            # Choose the default first sector
+    +2G                # Last sector automatically calculated for reserving 2GB
+                       # You may have to use Megabytes instead: +2048M
+
+    # You may repeat the exact previous steps to create partition 2 (_partgrator)
+    # Just make sure the final number of blocks used by partition 1 and 2 are the same
+    # If there is a mismatch, check the end of this code block for a solution
+    # To check the partition table, use the 'p' command as showed before
+
+
+    # Create the 28GB partition 3
+    n
+    p                  # primary partition
+    3                  # partition 3
+    <Enter>            # Choose the default first sector
+    <Enter>            # Choose the default last sector
+
+    # Note that the default last sector is always the last possible unallocated sector
+    # starting from the chosen first sector. So basically the previous step means:
+    #  Create partition 3 with all the remaining unallocated sectors (28GB in this case)
+
+    # Make sure that there are 3 partitions, and sda1 and sda2 have the same block number
+    p
+
+    # Now write the changes to the partition table and exit fdisk
+    w
+
+    # If fdisk exits with an ioctl error saying that the kernel is still using the
+    # previous partition table, then safely eject the USB and replug it
+    # You can see how to do it from the command line at the end of this block
+
+    # Make sure that all the /dev/sda partitions are unmounted
+    grep sda /etc/mtab  # /dev/sda1 is mounted again - weird but it may happen
+
+    # Unmount it (repeat with the path to the other mounted partitions, if needed)
+    umount /dev/sda1
+
+    # Create an ext2 filesystem with label JFFS-scripts in the partition 1
+    mke2fs -t ext2 -L 'JFFS-scripts' /dev/sda1  # Answer yes to the prompt
+
+    # Create an ext2 filesystem with label _partgrator in the partition 2
+    mke2fs -t ext2 -L '_partgrator' /dev/sda2
+
+    # Create an ext4 filesystem with label Media-Server in the partition 3
+    mke2fs -t ext4 -L 'Media-Server' /dev/sda3
+
+    # Remember that the main partition labels must be unique in each device
+
+    # Note that your system may not support ext4, check it with the command:
+    grep ext4 /proc/filesystems  # If nothing is returned, it is unsupported,
+                                 # if so, use ext3 in the previous command
+
+    # Enable the max mount count (-c) and check interval (-i) features to ensure the
+    # integrity of the partitions by forcing e2fsck to perform full scans either after
+    # the partition has been mounted 5 times, or if 7 days has passed since last checkup
+    tune2fs -c 5 -i 7 /dev/sda1
+    tune2fs -c 5 -i 7 /dev/sda3
+
+    # Automatically mount the partitions by reloading the block devices
+    udevtrigger --subsystem-match=block   # Doesn't show output without the --verbose flag
+
+    # This process may take some seconds, the partitions are mounted under /tmp/mnt
+    # Run the following command until all /dev/sda partitions appear
+    grep sda /etc/mtab  # See in which folders the partitions are mounted (second field)
+
+    # Mark the JFFS-scripts partition (mounted in /tmp/mnt/JFFS_scripts) as a main one
+    # This is done by creating a .partgrator file in its root folder
+    # The content of this file should be the partition path of the _partgrator partition
+    echo '/dev/sda2' > /tmp/mnt/JFFS_scripts/.partgrator
+
+    # Flush the IO buffers/cache to be sure all changes are applied to our /dev/sda device
+    sync
+
+    # Now you have everything configured for partgrator scripts to work!
+
+    # Only the JFFS-scripts partition will be migrated if needed due to .partgrator
+    # You may place a .partgrator file in as many partitions as needed, but you have to be
+    # sure that all those partitions are exactly the same size as the _partgrator
+    # partition, otherwise you risk data loss should a migration happen
+    # Please note that a setup with multiple main partitions has not be extensively tested
+    # and requires enabling the $experimental_partition_reprocess variable
+
+    # You can now install all the scripts you want in the JFFS-scripts partition, place
+    # the media you would like to share in the Media-Server partition, and configure the
+    # Media Server/Samba settings from the ASUS UI
+    # It is recommended to choose 'Manual Media Server Path' and set the directory to
+    # your preferred location under the /tmp/mnt/Media_Server path
+
+    # Finally test that partgrator is working and the device is recognized by rebooting
+    # and checking the system log for partgrator output
+
+
+    #### TROUBLESHOOT SECTION ####
+
+    #####################################################################
+    #        Fix fdisk block mismatch between partitions 1 and 2        #
+    #####################################################################
+
+    # First delete partition 2 (and 3 if you created it)
+    d
+    2
+
+    # Calculate the exact number of sectors used by the partition 1 for partition 2
+    p                  # print the partition table and annotate the difference
+                       # between the Start and End sectors of /dev/sda1
+                       # Example: 4029468 (end) - 58 (start) = 4029410 (sda1 sectors)
+
+    # Now create the 2GB partition 2 (_partgrator) using the calculated sectors
+    n
+    p                  # primary partition
+    2                  # partition 2
+    <Enter>            # Choose the default first sector
+    +4029410           # Calculated sda1 sectors from the previous step
+
+    # And now you may continue with the rest of the procedure (creating partition 3)
+    # as described previously
+
+    #####################################################################
+
+
+    #####################################################################
+    # How to eject and replug the device /dev/sda from the command line #
+    #####################################################################
+    # Get the usb node and path for the /dev/sda device:
+    nvram dump | grep sda   # The node is 2, embedded in the 'usb_path2_fs_path0' variable
+                            # The path is 3-1, the value of 'usb_path_sda' variable
+
+    # Eject the device without unplugging
+    ejusb 2 0 -u 0          # The 2 is the node, taken from 'usb_path2_fs_path0'
+
+    # Unbind the device by path (kernel unplug)
+    echo 3-1 > /sys/bus/usb/drivers/usb/unbind  # The 3-1 is the value of 'usb_path_sda'
+
+    # Bind the device back (kernel plug)
+    echo 3-1 > /sys/bus/usb/drivers/usb/bind
+
+    # Reload the block devices (not really necessary)
+    udevtrigger --subsystem-match=block   # Doesn't show output without the --verbose flag
+
+    # Note that, after performing the re-binding, the device name may be changed
+    # This means that the /dev/sda device may have now become /dev/sdb
+    # If so, use sdb instead of sda for all the other commands after fdisk
+
+    #####################################################################
+  #+end_src
+
+* Multiple Main Partgrator Partitions
+  Partgrator allows a device configuration with more than one main partgrator partition, but note this has not been extensively tested and requires setting the variable ~$experimental_partition_reprocess~ to 1.
+
+  *Important*: Every *main partition* needs to have a unique label.
+
+  Creating such device has to be done [[#Manual-Partgrator-Device-Creation][manually]].
+
+  This setup is useful in the following cases:
+  - Having main partitions with different filesystems (one ext2 and other ext4 like implemented in the [[#Manual-Partgrator-Device-Creation][Manual Partgrator Device Creation]], though in that example only one partition was configured as main partgrator partition)
+  - Reserving more space for the user (a device configured with 3 main partgrator partitions will only reserve 1/4 of the available size to the partgrator partition)
+
+  Currently partgrator doesn't support setups with main partgrator partitions of different size (note that each of them would require a partgrator partition of the same size), but this will be possible in the next [[https://github.com/caribpa/partgrator/issues/1][major update]].
+
+* User scripts
+  Partgrator's core functionality is split in [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#pre-mount][pre-mount]] and [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#post-mount][post-mount]] scripts:
+  - [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#pre-mount][pre-mount]]  - Wraps ~e2fsck~ in a function to be executed by [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/USB-Disk-Check-at-Boot-or-Hot-Plug-(improved-version)][disk-check]]
+  - [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#post-mount][post-mount]] - Analyzes ~e2fsck~ partition statuses and migrates if required
+
+  Additionally the following [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts][user scripts]] are invoked by ~partgrator-installer~ and ~partgrator-post~ if a migration is needed:
+  - [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#unmount][unmount]]            - with a mountpoint as a parameter before being unmounted
+  - [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#services-start][services-start]]     - after a migration (or ~usb-creator~) finished successfully
+  - [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#services-stop][services-stop]]      - before migrating (or temporarily saving) a partition's data
+  - [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#service-event][service-event]]      - indirectly called when executing ~service~ (before)
+  - [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#service-event-end][service-event-end]]  - indirectly called when executing ~service~ (after)
+  - [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#post-mount][post-mount]]         - from ~partgrator-post~ if ~experimental_partition_reprocess=1~
+
+  Note that some of these scripts may take some minutes to finish if they call other user scripts that expect to find partitions/mountpoints that are not ready. These third-party scripts might create files into the folder they expect to find the mountpoint they were configured/installed in (~JFFS-scripts~) without even checking if it is mounted. This behavior (creating files in empty mountpoint folders) prevents ~partgrator-pre~ from cleaning such folder, and in turn the system creates and mounts the partition into a different folder (~JFFS-scripts(1)~), preventing the other scripts (like [[https://diversion.ch/][Diversion]] or [[https://github.com/Adamm00/IPSet_ASUS][Skynet]]) from finding the folder they expect (~JFFS-scripts~). Have this in mind if you decide to use a new device (USB) for installing partgrator and other scripts without uninstalling/disabling them (or better managing/commenting the commands they added in ~post-mount~, ~services-stop~, etc) before.
+
+  By default, the error code returned by the directly invoked [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts][user scripts]] (~unmount~, ~services-start~, and ~services-stop~) is ignored (a warning will appear in the logs). The reason behind this decision is that the error code returned from the user scripts is the one returned from the last executed command. Because other scripts (like [[https://diversion.ch/][Diversion]] or [[https://github.com/Adamm00/IPSet_ASUS][Skynet]]) automatically add commands to these files and don't exit the script on failure, or don't check the environment extensively before executing a command (for example disabling a swapfile without checking if it was previously enabled and the file exists), it is not reliable to assume that the errors returned indicate real failure, thus the migration (or installation) process shouldn't be aborted.
+  If you really want partgrator to take those errors seriously, you may disable the variables: ~$ignore_start_service_error~, ~$ignore_stop_service_error~, ~$ignore_unmount_error~, and ~$ignore_kill_process_error~.
+
+  You can prevent partgrator from running any of the additional scripts (non-indirect) by setting their ~script_~ variable to ~:~ (null command) in ~partgrator-helper~, example: ~script_services_start=":"~ (now partgrator won't ever run ~services-start~).
+
+  It is recommended in a multi-device, or multi-partition setup (like the one [[#Manual-Partgrator-Device-Creation][manually configured]]) to check in [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#post-mount][post-mount]] and [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#unmount][unmount]] for the mountpoint passed as a parameter to the script to prevent other mountpoints from executing unwanted commands. For example, only enable/disable [[https://diversion.ch/][Diversion]] and [[https://github.com/Adamm00/IPSet_ASUS][Skynet]] when the main partgrator partition is ready/being unmounted:
+  - ~unmount~:
+    #+begin_src sh
+      #!/bin/sh
+
+      if [ "$1" = "/tmp/mnt/JFFS-scripts" ]; then
+          /jffs/scripts/firewall disable
+          /opt/bin/diversion disable
+
+          # Diversion and Skynet added these two lines to unmount
+          [ "$(/usr/bin/find $1/entware/bin/diversion 2> /dev/null)" ] && /opt/bin/diversion unmount # Added by Diversion
+          swapoff -a 2>/dev/null # Skynet
+      fi
+    #+end_src
+  - ~post-mount~:
+    #+begin_src sh
+      #!/bin/sh
+
+      if [ "$1" = "/tmp/mnt/JFFS-scripts" ]; then
+          # Diversion and Skynet added these two lines to post-mount
+          swapon /tmp/mnt/Adblock-usb/myswap.swp # Skynet
+          . /jffs/addons/diversion/mount-entware.div # Added by Diversion
+
+          service restart_firewall
+          /opt/bin/diversion enable
+      fi
+    #+end_src
+
+  Also, you may test inside any of those scripts (except for [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#services-start][services-start]]) for the existence of a ~$migrating_file~ (defaults to ~/tmp/.migrating_partition~) to know when a migration is running. Example for [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#services-stop][services-stop]]:
+  #+begin_src sh
+    #!/bin/sh
+
+    if [ -f "/tmp/.migrating_partition" ]; then
+        # Exit the script if a migration is going on
+        exit
+    fi
+
+    # [...] other commands
+  #+end_src
+
+  In the case of [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#services-start][services-start]], you have to resort to your own mechanism to distinguish when ~services-start~ is being executing at boot and when it is partgrator doing it. Example:
+  #+begin_src sh
+    #!/bin/sh
+
+    if [ -f "/tmp/.services_start_at_boot" ]; then
+        # Partgrator is executing this script at this line
+        # Start your other services here
+        exit
+    fi
+
+    # The script is being executed at boot at this line
+    # Start your services at boot here
+
+    touch "/tmp/.services_start_at_boot" # Create file for when partgrator runs the script
+  #+end_src
+
+  Note that, by default, [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#unmount][unmount]], [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#pre-mount][pre-mount]], and [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#post-mount][post-mount]] are either not executed (~unmount~), or partially executed (~pre/post-mount~) for partgrator partitions/mountpoints.
+  You may change that behavior by setting to 1 the variables ~$partgrator_unmount~, ~$partgrator_pre_mount~, and ~$partgrator_post_mount~.
+
+  These script variables are defined in [[#partgrator-helpers][partgrator-helpers]].
+
+* Customization
+  Every partgrator script has customizable variables placed at the beginning to allow users to set their preferred paths, timeouts, tags, etc.
+
+  Some scripts allow overriding their customizable variables by setting them in the environment prior to their execution (using ~export~ and/or running the script like: ~var1=val1 var2=val2 sh partgrator-installer~).
+
+  At this time there is no unified place (file) for setting all the preferred user variables. This feature will appear in a future release, as stated in the [[#Improvements-TO-DOs][Improvements (TO-DOs)]] section.
+
+  Note that, by default, the variables values are tuned for having uptime as a priority. This means that corrupted partitions (as detected by the kernel or ~e2fsck~) are mounted in read-write mode (as usual), and the errors returned from the [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts][user scripts]] are ignored (as the other scripts using the ~user-scripts~ don't return early in case of an error, and don't perform extensive system check before issuing a command, resulting in returning unreliable errors), though warnings are included into the logs whenever this happens. Of course you may change that behavior to better suit your needs by toggling the variables ~$ignore_start_service_error~, ~$ignore_stop_service_error~, ~$ignore_unmount_error~, and ~$ignore_kill_process_error~.
+
+  The [[https://tldp.org/LDP/Linux-Filesystem-Hierarchy/html/lostfound.html][lost+found]] folder is excluded from the migration process by default to prevent it from growing indefinitely. See [[#Why-it-works][Why it works]] for a more detailed reasoning. Though if you prefer it, you can preserve it by removing it from ~$tar_exclude~.
+
+** partgrator-installer
+   All the variables listed below can be overridden by the environment:
+   #+begin_src sh
+          user_swapfile="myswap.swp"
+       archive_swapfile=0      # 0 -> default ; 1 -> ask
+
+           jffs_scripts="/jffs/scripts"
+            jffs_addons="/jffs/addons"
+
+       pre_mount_script="${jffs_scripts}/pre-mount"
+      post_mount_script="${jffs_scripts}/post-mount"
+
+      disk_check_script="${jffs_addons}/amtm/disk-check"
+         install_folder="${jffs_addons}/partgrator"
+
+     partgrator_installer="${install_folder}/installer"
+       partgrator_helpers="${install_folder}/helpers"
+           partgrator_pre="${install_folder}/pre"
+          partgrator_post="${install_folder}/post"
+
+          download_tool="curl"
+       download_retries=3      # Unset for disabling
+      download_override=""     #   Set for enabling
+
+     ext_max_mount_count=5   # Times - Check tune2fs -c
+      ext_check_interval=7   # Days  - Check tune2fs -i
+     ext_errors_behavior="continue"  # Check tune2fs -e
+
+     parameters="$@"    # The script's parameters passed
+
+       run_from_file=0  # Values: 0 -> false ; 1 -> true
+          batch_mode=0  # Values: 0 -> false ; 1 -> true
+
+                 tmp="/tmp"
+            tmp_tars="${tmp}/${install_folder##*/}-tars"
+
+         tar_exclude="
+             #############################################################################
+             #
+             #   < Files and directories excluded by tar when backing up a mountpoint >
+             #
+             #############################################################################
+             #
+             # > Put one file or directory per line, or separated by a newline keyword: \n
+             # > Comments must be on their own line and start with #
+             # > Empty lines or lines with only spaces or tabs will be deleted
+             #
+             # > As tar doesn't distinguish files from directories (adding a trailing
+             # > slash to the pattern won't match anything; you can use a * wildcard after
+             # > the slash to exclude everything inside), I'll refer to both files and
+             # > directories when using the world 'file' in the rest of this description
+             #
+             # > POSIX Wildcards (glob) are supported
+             # > Escape the wildcard symbols with \ when you want to match them literally
+             # > Double quotes and symbols interpreted by the shell also need escaping
+             # > Prefix ./ to match files only on the mountpoint's root folder
+             #
+             # > Examples:
+             #   > Exclude a file inside a specific folder from the root: ./path/to/file
+             #   > Exclude a file anywhere but related to a hierarchy:      path/to/file
+             #   > Exclude a folder's content anywhere:                     folder/*
+             #   > This WON'T exclude a folder (nor a file) anywhere:       folder/
+             #
+             # > Consult -X or --exclude in busybox tar's manual for more information
+             #
+             #############################################################################
+
+             ./.minidlna
+             ./lost+found
+
+             #############################################################################
+             #
+             # > IMPORTANT: Setting the variable in the environment takes precedence
+             # >            over this variable. So none of the previously listed files
+             # >            will be excluded if you don't explicitly add them.
+             #
+             # >            You may use a \n between files to simulate new lines:
+             # >            tar_exclude='./.minidlna\n./lost+found'
+             #
+             ############################################################################"
+   #+end_src
+
+** partgrator-helpers
+   The following variables can be set both manually (~default_~) and with the environment:
+   #+begin_src sh
+     logfile="${partgrator_dir}/partgrator.log"  # Logfile, disabled if empty
+
+     log_tag="partgrator"           # Tag used as prefix when logging messages
+     logfile_date_format="+%T"      # Date's format when logging to ${logfile}
+     logfile_newline=1              # Boolean for adding newlines after logging
+     logfile_stamp=1                # Boolean for adding a stamp to the logging
+     logger_flags="-p notice"       # Flags passed to the system logger tool
+     mount_timeout=20               # Time in seconds to wait for a mountpoint
+     unmount_timeout=10             # Time in seconds to wait when unmounting
+     try_lazy_unmount=0             # Boolean for attempting lazy unmounting
+     start_services=''              # Services (space separate) to try starting
+     stop_services='nasapps'        # Services (space separate) to try stopping
+     ignore_start_service_error=1   # Boolean for ignoring services-start error
+     ignore_stop_service_error=1    # Boolean for ignoring services-stop errors
+     ignore_unmount_error=1         # Boolean for ignoring unmount errors
+     ignore_kill_process_error=1    # Boolean for ignoring kill (process) error
+     partgrator_pre_mount=0         # Boolean for completely running pre-mount,
+     partgrator_post_mount=0        # post-mount scripts with partgrator partitions
+     partgrator_unmount=0           # and unmount
+   #+end_src
+
+   The following variables need to be set manually:
+   #+begin_src sh
+        partgrator_dir="/jffs/addons/partgrator"    # Partgrator installation directory path
+
+      partgrator_label="_partgrator"                # Base label (name) of the partitions used
+                                                    # for migration purposes. For example:
+                                                    # _partgrator, _partgrator-test, and other
+                                                    # suffixes are detected just by setting
+                                                    # this variable to _partgrator
+                                                    # Note that it cannot contain symbols with
+                                                    # special shell/RE meaning:()[]+*?.\/^$|&"'
+
+       partgrator_file=".partgrator"                # Place this file in the root folder of a
+                                                    # partition to allow partgrator to migrate
+                                                    # the data in case the partition gets
+                                                    # corrupted and unable to be fixed by
+                                                    # disk_check
+
+     partitions_status="/tmp/.partitions_status"    # Statuses returned by disk-check's fsck
+        migrating_file="/tmp/.migrating_partition"  # Indicates that a migration is in progress
+
+            script_unmount="/jffs/scripts/unmount"        # AsuswrtMerlin unmount        script
+     script_services_start="/jffs/scripts/services-start" # AsuswrtMerlin services_start script
+      script_services_stop="/jffs/scripts/services-stop"  # AsuswrtMerlin services_stop  script
+   #+end_src
+
+   The following variables can be overridden by the environment:
+   #+begin_src sh
+            logger="logger"       # System's log utility
+     logger_output="> /dev/null"  # Suppress log_msg tee stdout
+
+                 mtab="/etc/mtab" # File of mounted partitions
+     proc_filesystems="/proc/filesystems" # Kernel Filesystems
+           proc_swaps="/proc/swaps"       # Active Swap
+                  opt="/opt"              # Path of opt folder
+          usb_drivers="/sys/bus/usb/drivers/usb"
+   #+end_src
+
+   And the following depends on the ~usb_drivers~ value:
+   #+begin_src sh
+       usb_bind="${usb_drivers}/bind"     # Needed for performing a kernel's plugging   action
+     usb_unbind="${usb_drivers}/unbind"   # Needed for performing a kernel's unplugging action
+   #+end_src
+
+** partgrator-pre
+   The following variables need to be set manually:
+   #+begin_src sh
+     partgrator_dir="/jffs/addons/partgrator"    # Partgrator installation directory path
+
+       logfile_truncate_lines=500  # Lines to remain on ${logfile} after being truncated
+     logfile_truncate_minutes=30   # Minutes for truncating ${logfile} since last modification
+
+      process_tools="e2fsck"       # disk-check tools whose return code will be processed by
+                                   # partgrator and a migration will be scheduled if needed
+                                   # Note that the tool name can only contain characters
+                                   # considered valid as function names
+
+       mount_folder="/tmp/mnt"     # Absolute path to the folder where the partitions are
+                                   # automatically mounted
+   #+end_src
+
+** partgrator-post
+   The following variables need to be set manually:
+   #+begin_src sh
+     partgrator_dir="/jffs/addons/partgrator"    # Partgrator installation directory path
+
+                                         # A migration will be performed when the error code
+                                         # returned by disk-check is in the min-max range of:
+     min_error_code=4                    # Minimum error code returned by disk-check
+     max_error_code=31                   # Maximum error code returned by disk-check
+
+      eject_code=2                       # disk-check error code requiring ejecting the device
+
+     force_eject=0                       # Boolean toggling force ejecting mounted partitions
+
+     experimental_partition_reprocess=0  # Boolean toggling the experimental reprocessing of
+                                         # the caller partition in case a partgrator partition
+                                         # was already used by another main partition in a
+                                         # prior execution of this script
+     tar_exclude="
+             #############################################################################
+             #
+             #   < Files and directories excluded by tar when performing a migration >
+             #
+             #############################################################################
+             #
+             # > Put one file or directory per line, or separated by a newline keyword: \n
+             # > Comments must be on their own line and start with #
+             # > Empty lines or lines with only spaces or tabs will be deleted
+             #
+             # > As tar doesn't distinguish files from directories (adding a trailing
+             # > slash to the pattern won't match anything; you can use a * wildcard after
+             # > the slash to exclude everything inside), I'll refer to both files and
+             # > directories when using the world 'file' in the rest of this description
+             #
+             # > POSIX Wildcards (glob) are supported
+             # > Escape the wildcard symbols with \ when you want to match them literally
+             # > Double quotes and symbols interpreted by the shell also need escaping
+             # > Prefix ./ to match files only on the mountpoint's root folder
+             #
+             # > Examples:
+             #   > Exclude a file inside a specific folder from the root: ./path/to/file
+             #   > Exclude a file anywhere but related to a hierarchy:      path/to/file
+             #   > Exclude a folder's content anywhere:                     folder/*
+             #   > This WON'T exclude a folder (nor a file) anywhere:       folder/
+             #
+             # > Consult -X or --exclude in busybox tar's manual for more information
+             #
+             #############################################################################
+
+             ./.minidlna
+             ./lost+found
+
+             #############################################################################
+             #
+             # > IMPORTANT: Setting the variable in the environment takes precedence
+             # >            over this variable. So none of the previously listed files
+             # >            will be excluded if you don't explicitly add them.
+             #
+             # >            You may use a \n between files to simulate new lines:
+             # >            tar_exclude='./.minidlna\n./lost+found'
+             #
+             ############################################################################"
+   #+end_src
+
+* Known issues and limitations
+  - Partgrator is only available for /ext devices/ (ext2, ext3, ext4) and there is no plan to support other filesystems due to lack of tools (natively available in Asuswrt-Merlin) to perform operations other than formatting
+  - The migrating procedure is delayed until at least one partgrator partition and one main partgrator partition has been processed (unless ~$experimental_partition_reprocess~ is enabled). Because the order in which the partitions of a device are mounted (thus executing both ~pre-mount~ and ~post-mount~ scripts) is not guaranteed, there may be occasions where a corrupted main partgrator partition gets mounted first (starting all the scripts in ~pre-mount~ and ~post-mount~), thus risking operating with corrupted data and wrongly overriding sane data. Only when the partgrator partition is mounted, the migration is performed. Note that this limitation will be resolved in the next major update, see [[https://github.com/caribpa/partgrator/issues/1][issue 1]] for more information, or enable ~$experimental_partition_reprocess~ to try the feature
+  - The system may run out of RAM when configuring a device with the ~usb-creator wizard~, see the [[#Out-of-RAM-when-creating-a-device-with-the-usb-creator-wizard][troubleshooting]] section for workarounds
+  - The /External USB disk status/ in the ASUS web UI may appear in red or show incorrect/incomplete information and/or features (such as not displaying the ASUS /Download Master/ quick access button even though it is usable and accessible by URL or under the general /USB Application/ tab) in the tab if the first partition that was mounted happened to be the partgrator partition. There is no workaround available as the mount ordering of the partitions is not guaranteed (meaning: it's not guaranteed that /dev/sda1 is always mounted first)
+  - It's not possible to set multiple extended mount options with ~tune2fs -E mount_opts=<coma separated extended mount options quoted string>~ due to the conflicting parsing mechanism implemented in tune2fs ([[https://serverfault.com/a/944433][reference]]). ~debugfs~ can be used as a workaround but it is not available on Asuswrt-Merlin. When multiple extended mount options are detected, they are written into the partition's [[https://www.kernel.org/doc/html/latest/filesystems/ext4/globals.html#super-block][superblock]] separated by spaces, and a warning is issued
+
+* Troubleshooting
+** Out of RAM when creating a device with the usb-creator wizard
+   If there are swapfiles in your device, check [[#Partgrator-scripts-and-installer-is-unable-to-unmount-my-device-USB][unable to unmount my device]] for a permanent solution.
+
+   The following assumes that the issue happens in the ~usb-creator~ when archiving a mountpoint into a ~.tar.gz~ file.
+
+   These are the possible workarounds (from easiest to hardest):
+   1. Disable ~JFFS custom scripts and configs~ and reboot (don't forget to re-enable them after running the ~usb-creator~ + reboot once again)
+   2. Choose an empty device (or make sure that its used size is less than the available RAM) when running the ~usb-creator~ wizard
+   3. Disable the running services/scripts from the ASUS UI and/or ~amtm~ (don't forget to re-enable them after the process)
+   4. Disable logging from the running services/scripts and remove the logs (unattended they can fill all the memory of your device)
+   5. Connect another device (USB) with enough space (more than the available RAM) and rerun the ~usb-creator wizard~ with the ~$tmp~ or ~$tmp_tars~ variable set to its mountpoint
+   6. Create and enable a swapfile (2GB best) in another device. You can use ~amtm~ for this purpose. Make sure that there are no commands in ~unmount~ or ~services-stop~ that may disable it during the ~usb-creator~ process (like ~swapoff -a~).
+   7. Remove all swapfiles in your device (likely to do nothing as they get compressed very efficiently), or, run the installer with ~$archive_swapfile=1~ to be asked for excluding (individually) the detected swapfiles even if ~usb-creator~ thinks there's enough space in the new partition for storing everything from the old one.
+   8. [[#Manual-Partgrator-Device-Creation][Manually create a partgrator compatible device]]
+   9. In any system with a POSIX shell (with [[#Busyboxs-ash-specific-1251---aarch64][some exceptions]]) and enough RAM to perform the installation override the [[#System-specific-utilities][system specific utilities]], install the [[#Non-POSIX-utilities][non-POSIX utils]] and run the installer with the ~usb-creator~ parameter (with the device plugged into that system)
+
+** The installation procedure was interrupted and my device (USB) data was lost
+   If the cleanup was never performed (or it was answered /Yes/ to the prompt about keeping the /tar/ data), then you may find your data compressed in a ~.tar.gz~ file named after your partition's label at ~/tmp/partgrator-tars~ (or whatever the variable ~$tmp_tars~ is set to).
+
+   *Please always back up your important data*.
+
+** Partgrator (scripts and installer) is unable to unmount my device (USB)
+   Other scripts/services may be using your device when a migration is scheduled or installing partgrator.
+
+   Also, an active swapfile placed in any of your chosen device's partition prevents it from being unmounted.
+   Partgrator detects active swapfiles in your partition and attempts to disable them.
+
+   Because some swapfiles are used by other scripts, they have to be stopped first to allow freeing memory (or their locks).
+
+   Partgrator runs ~/jffs/scripts/services-stop~ (or whatever the variable ~script_services_stop~ is set to) in different circumstances (before unmounting, formatting, or attempting to disable swapfiles).
+
+   Before unmounting, partgrator also runs ~/jffs/scripts/unmount~ (or whatever the variable ~$script_unmount~ is set to) with the mountpoint of the partition being unmounted as a parameter.
+
+   Place inside these scripts the appropriate commands that need to be performed to free the mountpoint's swapfiles and/or perform other operations before a migration/installation.
+
+   Partgrator also runs ~/jffs/scripts/services-start~ (or whatever the variable ~script_services_start~ is set to) after a migration/installation has completed successfully, and whenever the device (USB) needs to be reloaded (for example when ~e2fsck~ exists with error code 2, or whatever code is the variable ~$eject_code~ set to).
+
+   Find examples about what to place in these scripts in the [[#User-scripts][User scripts]] section.
+
+   Special mention goes for any of the ASUS Utilities, as they don't use the [[#User-scripts][User scripts]] and not all can be stopped using ~service~ (like the [[https://www.asus.com/support/FAQ/114001/][Download Master]]). Partgrator attempts to find and kill any process that is still using the ~/opt~ folder (or whatever the variable ~$opt~ is set to) after calling ~services-stop~ and ~unmount~ user scripts.
+
+** How to ensure the data's integrity with your own script
+   Partgrator cannot guarantee the integrity of the data on filesystem corruption.
+
+   Even though using partgrator with aggressive ~tune2fs~ -i and -c values can greatly reduce the chances of data corruption, users who want to be sure that their data cannot corrupt should design a data backup+recovery mechanism. By parsing partgrator's status file (~/tmp/.partitions_status~) and knowing when a migration is taking place (~/tmp/.migrating_partition~) you can know when to back up and when to restore.
+
+   You may identify the partition status with a script in ~pre-mount~ (after ~disk-check~) that reads the file ~/tmp/.partitions_status~ (or whatever the ~$partitions_status~ is set to), and take action in ~post-mount~ (after ~partgrator-post~) accordingly (back up if clean, restore if not). Please note that a migration only happens if both a *main partgrator partition* and a *partgrator partition* are listed in ~/tmp/.partitions_status~, but this behavior will improve in the next [[https://github.com/caribpa/partgrator/issues/1][major release]].
+
+   Every line of the file ~/tmp/.partitions_status~ is structure as follows:
+   #+begin_src text
+     <partition path> <numeric error code> :<partition label>
+   #+end_src
+
+   ~/tmp/.migrating_partition~ (or whatever the variable ~$migrating_file~ is set to) is always empty and its existence implies that partgrator is running, but not necessarily means that a migration is happening at the moment.
+
+** Partgrator installer is not working / Other installer issues
+   Make sure that the [[#Requisites][requisites]] are met and that a working device (USB) is detected by the system.
+
+   You may find the installation procedure output in the file ~/tmp/partgrator.log~ (or whatever path the variable ~$logfile~ is set to).
+
+   For better assistance, attach your ~partgrator.log~ when creating an [[https://github.com/caribpa/partgrator/issues][issue]] with the title set to /[Installer issue]/ + keywords of the issue.
+
+** Partgrator scripts are not working / Other scripts issues
+   Make sure that the [[#Requisites][requisites]] are met, a Partgrator-ready device is detected by the system, and that a ~.partgrator~ file is placed in the root folder of your main partition.
+
+   Check that you can see any partgrator output (search for /partgrator/ with your browser's search: Ctrl+F).
+
+   If you are unable to find partgrator check the content of the file ~/jffs/addons/partgrator.log~ for errors (or whatever path the environment variable ~$logfile~ or the script variable ~$default_logfile~ is set to).
+
+   If you are still unable to make partgrator scripts work, please open an [[https://github.com/caribpa/partgrator/issues][issue]] (attach/upload your ~partgrator.log~ for better assistance) with the title set to /[Script issue]/ + keywords of the issue.
+
+* How it works
+** Setup
+   Partgrator requires at least two partitions configured in a specific way for it to work:
+   - The *main partition* (or partitions), which is the one (or ones) only usable by the user
+   - The *partgrator partition*, which is a partition exactly the same size as the main one and not to be used by the user
+
+   The partitions can be distinguished by their labels as the *partgrator partition* is named ~_partgrator~ (or whatever the variable ~$partgrator_label~ is set to), whereas *main partitions* have user defined labels.
+
+   Every *main partition* in a device must have a unique name (label), whereas multiple *partgrator partitions* should be named after ~$partgrator_label~ (it is possible to add prefixes to these labels. Example: ~_partgrator-JFFS~, ~_partgrator-Media~, etc). Using multiple *partgrator partitions* for different size *main partgrator partitions* will be possible in the next [[https://github.com/caribpa/partgrator/issues/1][major release]] (as of now there is no use for multiple *partgrator partitions*).
+
+   The *main partition* refers to both *main partgrator partition* and *main non-partgrator partitions*. The difference is that the *main partgrator partition* is processed by the partgrator scripts, whereas the *main non-partgrator partition* is ignored.
+
+   Marking a *main partition* as a *main partgrator partition* is done by placing a ~.partgrator~ (or whatever the variable ~$partgrator_file~ is set to) file in its root folder containing the *partgrator partition* path (example: ~/dev/sda2~).
+   This means that any *main partition* without a ~.partgrator~ file in its root folder is considered a *main non-partgrator partition* and not considered for the migration process.
+
+   *Main partgrator partitions* must have exactly the same size (blocks) as *partgrator partitions* to prevent data loss should a migration happen and a size mismatch exists between partitions.
+
+   *Main non-partgrator partitions* are not required to be the same size of the *partgrator partition* as they won't be migrated. See the [[#Manual-Partgrator-Device-Creation][manual device creation]] for an example setup of a Media Server with 3 partitions, 2 of them used for user data: one is a *main partgrator partition* and the other a *main non-partgrator partition*.
+
+   Partgrator also depends on the execution of a [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/USB-Disk-Check-at-Boot-or-Hot-Plug-(improved-version)][disk-check]] script (like the one available in [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/AMTM][amtm]]) at a certain time explained in the next sub-sections.
+
+** Partgrator scripts
+   When the system detects a device (USB) and [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts][JFFS custom scripts]] are enabled, the [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#pre-mount][pre-mount]] script is called with the detected partition path and its filesystem, executing ~partgrator-pre~ followed by ~disk-check~ (and other scripts).
+
+   ~partgrator-pre~ cleans old auto-generated mount folders (see below), truncates the logfile (also see below), and wraps the ~e2fsck~ utility in a function with the same name, so that the return code of ~e2fsck~ (along the partition path and label) is stored in the ~/tmp/.partitions_status~ temporary file (or whatever the variable ~$partitions_status~ is set to) when ~disk-check~ calls ~e2fsck~.
+
+   When the ~pre-mount~ script is completed, the partition is auto-mounted by the system in an automatically generated folder (derived from the partition's label or partition device if no label was assigned) under ~/tmp/mnt~ folder, and then the [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#post-mount][post-mount]] script is executed with the partition's mountpoint as parameter, calling ~partgrator-post~ first.
+
+   ~partgrator-post~ parses ~/tmp/.partitions_status~ and decides (depending on ~e2fsck~ return code) what to do:
+   - Do nothing if ~/tmp/.partitions_status~ only has one partition
+   - Safely unmount the partgrator partition if no procedure is necessary and early exit the ~post-mount~ script (this behavior can be modified by toggling the ~$partgrator_post_mount~ variable)
+   - Fix labels if duplicated labels are found and a main partition is detected (recovery procedure)
+   - Move the ~.partgrator~ file to the main partition if found in a partgrator partition (recovery procedure)
+   - Safely replug (eject and re-detect) the device if ~e2fsck~ fixed it and [[https://man7.org/linux/man-pages/man8/e2fsck.8.html#EXIT_CODE][requires a reboot]] (error code 2 or whatever the variable ~$eject_code~ is set to)
+   - [[#Migration][Safely migrate]] the data from one partition to the other (after formatting it) if ~e2fsck~ error code indicates that ~manual intervention~ is required (errors code from 4 to 31 or whatever the variables ~$min_error_code~ and ~$max_error_code~ are set to)
+   - Safely unmount all the affected partitions and replug their devices after any procedure where a label was changed
+   - Delete the lines of the processed partitions in ~/tmp/.partitions_status~
+
+   Note that the ~partgrator-post~ procedure is repeated for every partition detected by the ~partgrator-pre~ procedure if they were unmounted before starting ~pre-mount~.
+
+   Both ~partgrator-pre~ and ~partgrator-post~ use a set of common functions found in ~partgrator-helpers~ (also used by ~partgrator-installer~).
+
+   During all the stages of the process, output is generated by the ~logger~ utility (including failures), and also stored in the ~/jffs/addons/partgrator.log~ file (or whatever the ~$logfile~ variable is set to).
+
+** Migration
+   ~partgrator-post~ partition migration process works as follows:
+   1. The partgrator partition is formatted with the exact attributes (label, filesystem, filesystem attributes/features, max mount count, check interval, errors behavior, mount options, and extended mount options) of the main partgrator partition, using ~mke2fs~ and ~tune2fs~
+   2. Once ready, the partgrator partition is mounted in its prior mountpoint or newly auto-generated mountpoint as a fallback
+   3. To be safe before continuing, all the services are stopped, the [[https://github.com/RMerl/asuswrt-merlin.ng/wiki/User-scripts#unmount][unmount]] script is called with both partitions, and all the running processes using the ~/opt~ folder are killed
+   4. All the data from the main partgrator partition except the reserved files (~.__*~), the ~.partgrator~ file, and user-specific files/directories as determined by the variable ~$tar_exclude~ (such as ~.minidlna~ and ~lost+found~) in the root folder, are securely copied (preserving all the original attributes, owners, and permissions) into the partgrator partition using ~tar~
+   5. The partgrator partition is renamed (label) with the same label as the main partgrator partition
+   6. The main partgrator partition is renamed ~_partgrator~
+   7. The ~.partgrator~ file is moved from the old main partgrator partition (new partgrator partition) into the new main partgrator partition (old partgrator partition)
+   8. Both partitions are securely unmounted and reloaded
+
+   Notes:
+   - If the second partition renaming (step 6) fails, an attempt is made to revert the previous renaming (step 5)
+   - No data is lost if the migration process is interrupted at any time. The cases where both partitions end with duplicate labels (interruption before step 6 is finished), or the ~.partgrator~ file is duplicated or not migrated (interruption before step 7 is finished), are all dealt with in the ~partgrator-post~ recovery procedure
+
+* Why it works
+** Background
+   The ext filesystem issues induced by powering off the system without safely unmounting the partitions mainly consist in inconsistencies in the metadata of the ext filesystem (inodes, blocks, directories entries, free space, etc) stored in the different [[https://www.kernel.org/doc/html/latest/filesystems/ext4/globals.html#super-block][superblock]] backups along the filesystem.
+
+   Usually, the inconsistencies found in an ext filesystem can be fixed automatically (~e2fsck~ -p option), but even when they can't (thus requiring ~manual intervention~) they don't normally prevent the partition from being mounted (even if it is done in read-only mode).
+
+   When ~e2fsck~ is run and able to repair the filesystem (either automatically with -p, or manually), it may find some files or directories whose inodes are not linked anywhere. Whenever this happens, such files or directories are placed into the [[https://tldp.org/LDP/Linux-Filesystem-Hierarchy/html/lostfound.html][lost+found]] directory in the partition's root folder.
+
+   In most cases, everything that's placed in [[https://tldp.org/LDP/Linux-Filesystem-Hierarchy/html/lostfound.html][lost+found]] is meaningless if the partition was interrupted when performing non critical operations (read more [[https://unix.stackexchange.com/a/18157][here]]) and its filesystem wasn't already corrupted. For example, unplugging a device (USB) when some of its files were opened by the system may result in the lost file descriptors, or some of the buffered content of the files, to be placed into [[https://tldp.org/LDP/Linux-Filesystem-Hierarchy/html/lostfound.html][lost+found]]. In the intended use of a main partgrator partition, this means that what can be found in that folder is, at best, segments of logfiles or temporary files.
+
+   Left unnoticed, an ext partition that has been repeatedly unmounted unsafely (powered-off) when it has been asking for a long time for ~manual intervention~ will most likely corrupt the filesystem structure, or the data (or kill the USB device if ~e2fsck~ tries every time the partition is mounted to repair it) even if ~manual intervention~ is applied (usually ~e2fsck~ -y) afterwards.
+
+   Note that issuing ~e2fsck -y~ to repair an ext filesystem does not guarantee recovery of either the filesystem nor the data, in fact it may just be the starting point for recovering the data as it will be placed into the [[https://tldp.org/LDP/Linux-Filesystem-Hierarchy/html/lostfound.html][lost+found]] folder (if recovered), and then it would be up to the user to manually analyze every file (named after their inode) in there and decide what to do with it. A very tedious and time-consuming process without guarantees.
+
+   Note that journaling filesystems may delay or prevent (or even promote) the issue (both data and filesystem) altogether (ext3 and ext4 filesystems). Partgrator can be used as a last resort option along with journaling to reduce data loss and corruption.
+
+   The real solution to ensure the data integrity after the filesystem has been corrupted, independently if the ~manual intervention~ is successful or not, is to use the data from a backup and place it into a freshly formatted partition.
+
+   Partgrator perfectly allows the user to setup their data backup and recovery mechanisms in the [[#User-scripts][user-scripts]] to ensure the integrity of the data while leaving to partgrator the job of maintaining the integrity of the filesystem. See how to do it [[#How-to-ensure-the-datas-integrity-with-your-own-script][here]].
+
+** Reason
+   Even if, as mentioned before, partgrator's task is to keep the filesystem fresh without guaranteeing the integrity of the data in it, the migrating procedure may simply be enough for preventing data corruption in devices (USBs) mostly used for reading and writing non-critical files (intended partgrator use-case).
+
+   Considering a non-corrupted and clean filesystem (used for partgrator's intended use-case), the first time a ~manual intervention~ is required there is very little chance that actual data has been lost (and it is even less likely that a ~manual intervention~ will recover it without requiring the user to analyze the [[https://tldp.org/LDP/Linux-Filesystem-Hierarchy/html/lostfound.html][lost+found]]).
+
+   To prevent the filesystem corruption from escalating (reducing chances of data loss), the partgrator scripts (~partgrator-post~) safely copy, at first sign of filesystem inconsistency, all the data (preserving all file attributes) from the corrupted partition into a freshly formatted one, using the latter as the new main partition (and the former as the new partgrator partition).
+
+   Even less chances of corruption are possible with aggressive values for the ext filesystem features ~check interval~, ~max mount count~, and ~errors behavior~ (~tune2fs~ flags -i, -c, and -e) considering ~e2fsck~ (~disk-check~) is allowed to run often enough. ~partgrator-installer~ will enable such features (though with moderate and tuned values for providing the best uptime) at the user's request. You may set your preferred values for these features with the variables ~$ext_max_mount_count~, ~$ext_check_interval~, and ~$ext_errors_behavior~ before running the installer.
+
+   Copying the data from one partition to the other is the safest way of ensuring that no data is lost should the copying process be interrupted or should the hardware be damaged. The partgrator partition will, after a migration, hold a copy of the old data (as it used to be the main partition) until a new migration is needed.
+
+   By default the [[https://tldp.org/LDP/Linux-Filesystem-Hierarchy/html/lostfound.html][lost+found]] folder is excluded from the migration process (to prevent it from filling unnecessarily if the user won't check it), but this behavior can be changed by removing its entry from the ~$tar_exclude~ variable. Of course this folder will remain in the old main partgrator partition (now new partgrator partition) until another data migration is required.
+
+   Note that the migration procedure produces a lot of reads and writes to the device, thus lowering its life expectancy. Though it only happens when a supported partition is detected (unlike journaling, which happens when the partition is being used), and a migration is needed.
+
+* Portability - Utilities and Builtins used
+  Partgrator is designed with portability in mind, using as many [[#POSIX-utilities][tools]] and [[#POSIX-builtins-regular-and-special][builtins]] as possible as described by the [[https://pubs.opengroup.org/onlinepubs/9699919799/idx/utilities.html][Utilities POSIX.1-2017 Specification]] and the [[https://pubs.opengroup.org/onlinepubs/9699919799/idx/sbi.html][Special Built-in Utilities POSIX.1-2017 Specification]].
+
+  The only exceptions, due to the fact that the POSIX version of the tools weren't implemented (or nonexistent alternatives and difficult/tedious to design a workaround), can be found in the [[#Busyboxs-ash-specific-1251---aarch64][Busybox specific]] section.
+
+  The other tools used are not POSIX but [[#Non-POSIX-utilities][really common]] in the GNU and BSD worlds, or [[#System-specific-utilities][specific]] of Asuswrt-Merlin and/or asuswrt.
+
+  One of the objectives for a future major version of partgrator (see [[#Improvements-TO-DOs][improvements]]) is to be system-independent by providing template functions for the [[#System-specific-utilities][system specific]] utilities to allow easy-porting.
+
+  If you think partgrator would be a great addition for another system, please [[https://github.com/caribpa/partgrator/issues][open an issue]] with /[Porting]/ + name of the system/OS in the title and include relevant details about the system's procedure for detecting devices (USBs) on connection in the description.
+
+** System specific utilities
+    - ejusb
+    - logger
+    - nvram
+    - service
+    - udevtrigger
+
+** Non-POSIX utilities
+    - blkid
+    - blockdev
+    - curl (or wget)
+    - e2fsck
+    - fdisk
+    - mke2fs
+    - mount
+    - readlink
+    - socat
+    - swapoff
+    - sync
+    - tar
+    - tune2fs
+    - umount
+    - wget (or curl)
+
+** Busybox's ash specific (1.25.1 - aarch64)
+    - date -r <file> +%s  (stat wasn't implemented)
+    - ps w                (this ps implementation only supports w <wide> and T <threads>)
+    - set -o pipefail     (available in most shells and tedious to replace, see [[https://unix.stackexchange.com/a/70675][1]] and [[https://cfaj.ca/shell/cus-faq-2.html][2]])
+    - ~${var/<expr>/<repl>}~ and ~${var//<expr>/<repl>}~ (available in most shells - [[#Improvements-TO-DOs][TO-DO]])
+
+** POSIX utilities
+    - [    (test)
+    - awk
+    - cat
+    - chmod
+    - cp
+    - cut
+    - date
+    - df
+    - du
+    - echo
+    - expr
+    - grep
+    - kill
+    - mkdir
+    - mv
+    - printf
+    - ps
+    - rm
+    - rmdir
+    - sed
+    - sh
+    - sleep
+    - tail
+    - tee
+    - touch
+    - wc
+    - xargs
+
+** POSIX builtins (regular and special)
+    - . (dot   - source util)
+    - : (colon - null util)
+    - break
+    - continue
+    - eval
+    - exec
+    - exit
+    - false
+    - read
+    - return
+    - set
+    - shift
+    - trap
+    - type
+    - unset
+
+* Code - Shell tricks and Workarounds
+  This section is a compilation of some of the tricks and workarounds used when designing partgrator.
+
+  Apart from publicly documenting the tricks for future reference of what not to do, the purpose of this section is to record the code that will probably break when using different versions/implementations of the tools/shell used for the workarounds, even though they have been tested in ~ash~, ~bash~, ~zsh~, "~sh~", and ~dash~.
+
+** Trick mke2fs to believe it is in a pty with socat
+   This workaround is used to retrieve a partition's filesystem independently on whether it is mounted or not.
+
+   Normally, ~blkid~ is the tool you want to use for retrieving this information (from the ~TYPE~ field), but Asuswrt-Merlin ~blkid~ (Busybox v1.25.1 implementation) only provides the ~LABEL~ and ~UUID~ fields.
+
+   The only other tool that reports this information as a warning when being run interactively is ~mke2fs~. Once a pipe is connected to ~mke2fs~, it is run in batch mode and such warning is not issued.
+
+   So how to run ~mke2fs~ interactively and on a pipe to filter the output? Tricking it to think it is being run alone in a pty or tty, and the only command available in Asuswrt-erlin to perform such thing is ~socat~.
+
+   ~socat~ can run a command in a pty and attach it the file descriptors 0 and 1 (read and write) with the ~STDIO~ address, thus preventing ~mke2fs~ from running in batch mode, and allowing piping ~socat~'s output into a filter.
+
+   ~socat~ is run in a child process (~&~) to prevent the filter command from getting stuck in the pipe once it has found a match.
+
+   Brackets (as known as compound-list, or parentheses: sub-shell) are required to use pipes with child processes (at least in ~ash~ and the POSIX shell ~dash~).
+
+   ~mke2fs~ is run with the -n flag (dry-run) to prevent a partition from being created should something unexpected make ~mke2fs~ continue.
+
+   #+begin_src sh
+     { socat EXEC:"mke2fs -q -t ext2 -n ${partition}",pty STDIO 2>/dev/null & } | ${filter}
+   #+end_src
+
+   [[https://github.com/caribpa/partgrator/blob/master/partgrator-helpers#L301][Code link]].
+
+** Ignore everything typed before the last <Enter> with cat and awk
+   This trick is used when running ~partgrator-installer~ interactively (or with ~$batch_mode~ set to 0) to prevent accidental <Enter> presses (or text typed followed by <Enter>) from answering the next prompt ~partgrator-installer~ is going to present the user without them having the chance to even read it.
+
+   ~cat~ is mainly used to show (to stdout) the content of a file (or files). When executed without parameters, it reads from the user input (stdin), until it is interrupted, and outputs into stdout.
+
+   The input that ~cat~ reads in this trick is what the user typed by mistake, but ~cat~ needs to be stopped before allowing the user to answer the prompt, even if nothing was send into the input, and also ~cat~ shouldn't output anything.
+
+   To silence ~cat~'s output, even though one may think that a shell redirection into /dev/null would do the trick, the fact is that it doesn't if ~cat~ is interrupted fast enough.
+
+   It turns out that ~awk~ can act as a non-blocking /dev/null (~xargs -s1~ also works, but it returns an error), basically because it processes the input (stdin or file) even if told to immediately exit (unlike ~sed 'q'~ that requires some input).
+
+   To interrupt some command on a pipe chain from a different one, it is necessary to resort to a shell (~sh~) to first retrieve the PID of the process (the shell's PID), send it down the pipe chain, and then ~exec~ the command that wants to be run, in order for it to inherit the shell's PID. Now we can interrupt (or ~kill~) the command from another part down the pipe chain.
+
+   Everything said before put into its place looks like this:
+   #+begin_src sh
+     sh -c 'echo $$; exec cat' | { read pid; awk "BEGIN{exit}"; kill -s INT ${pid}; }
+   #+end_src
+
+   [[https://github.com/caribpa/partgrator/blob/master/partgrator-installer#L1335][Code link]].
+
+** Check that files exist using shell expansion (glob) and test ([)
+   This is a trick used for checking if there are any files on a directory, or if it contains files with a specific extension.
+
+   Shell expansion ([[https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#tag_18_13][Pattern Matching Notation]]) is used to try matching files/directories on a directory. In the case the shell cannot match anything, the shell expansion is interpreted as a literal path.
+
+   It should be noted that shell expansion doesn't expand into hidden files (the ones whose name start with a dot) unless it is explicitly added at the beginning of the match before adding a shell expansion special character. So ~path/*~ doesn't include hidden files, but ~path/.*~ only includes hidden files.
+
+   ~test~ or ~[~ with the -e flag is used to check for the existence of (individual) files, directories, and other special files. According to the [[https://pubs.opengroup.org/onlinepubs/9699919799/utilities/test.html#tag_20_128_14][test error code section in the POSIX.1-2017 Specification]], the expected error codes are: 0 (expression is true), 1 (expression is false or missing expression), >1 (an error occurred).
+
+   Using shell expansion with ~test~ yields two possible outcomes:
+   - the shell expansion worked (or it didn't but the literal expression exist), so test returns either 0 or >1 (an error happened when test was called with multiple parameters)
+   - the shell expansion didn't work (and the literal expression doesn't exist), and test returns 1
+
+   By silencing ~test~ stderr (to /dev/null) and checking whether its return code is 1 or not, it can be known if a directory contains specific files:
+   #+begin_src sh
+     if { [ -e "${install_folder}/"*.bak ] 2> /dev/null; [ $? -ne 1 ]; }; then
+         # ${install_folders} has at least one file with a .bak extension
+     fi
+   #+end_src
+
+   [[https://github.com/caribpa/partgrator/blob/master/partgrator-installer#L551][Code link (one of the many instances)]].
+
+** Fixing tar gzip's short write when reading excluded files from stdin
+   This is a workaround to allow creating a ~.tar.gz~ file with Asuswrt-Merlin busybox (v1.25.1) ~tar -zcf~ when reading from stdin a list of files or directories to exclude (-X flag).
+
+   The file and directory (there's actually no distinction between the two) exclusion present in ~tar -X~ is really useful as it accepts [[https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#tag_18_13][Shell Expansion]] special characters to exclude multiple matches with one shell expansion pattern.
+
+   -X expects to read a file in which each line contains the file, directory, or shell expansion pattern to exclude. To prevent creating a file just for listing the exclusions, a *-* can be used to tell ~tar~ to read from stdin, allowing to pipe the list of exclusions.
+
+   The issue with this implementation of ~tar~ is that the following command fails (error code 1) with the message ~gzip: short write~:
+   #+begin_src sh
+     printf "${excluded_files}" | tar -zcf "${tar_file}" -C "${folder_to_archive}" -X - .
+   #+end_src
+
+   The -C flag changes into the specified directory, so that only the content of the directory is archived (instead of full path including the directory and its parents), silencing the following message: ~tar: removing leading '/' from member names~, and allowing the -X flag to work without having to specify the full path minus the leading slash (see the ~$tar_exclude~ [[#partgrator-post][variable description]] for more information).
+
+   The workaround simple consists in sending to the stdout (again using *-*) the archive ~tar~ is creating, and using shell redirection to create ~$tar_file~:
+
+   #+begin_src sh
+     printf "${excluded_files}" | tar -zcf - -C "${folder_to_archive}" -X - . > "${tar_file}"
+   #+end_src
+
+   [[https://github.com/caribpa/partgrator/blob/master/partgrator-installer#L1876][Code link]].
+
+** Relaunch the installer from memory with sh or running from /tmp
+   This is a workaround to allow overriding ~partgrator-installer~ when reinstalling, updating, or uninstalling.
+
+   Because modifying a running script is [[https://www.shellscript.sh/tips/change-running-script/][not a good idea]] (though it depends on the shell), ~partgrator-installer~ relaunches itself from memory (only when installing or uninstalling) to avoid unexpected behavior.
+
+   The main workaround uses the same structure implemented in the [[#Download-scripts--Configure-device---one-liner][one-liners]] which is designed to prevent the [[https://stackoverflow.com/a/11475732][MAX_ARG_STRLEN]] issue.
+
+   The idea is to pipe to a shell the content of ~partgrator-installer~ while retaining interactivity (or not if the script was called from a pipe).
+
+   To retain interactivity, a plain ~cat~ can be used in the first chain of the pipe, though things get tricky when preventing the user from typing (or piping input) before the full content of ~partgrator-installer~ has been read. On the other hand, a mechanism for interrupting the ~cat~ in the first chain also has to be implemented for finishing the script smoothly without holding the input.
+
+   To make it more fun and challenging, running the script with certain variables set (like ~batch_mode=0~) triggers some weird syntax errors, unsure of the real reason but my guess is that the interpreter is expecting the end of some conditions that comes too late for the script to consider due to pipe-buffering.
+
+   *Warning:* Confusing text ahead, you may skip until the paragraph before presenting the command for a short summary.
+
+   First, the solution to the syntax error is enclosing everything piped to the shell in a compound-list (or function, and execute it afterwards; the only solution for re-running with the original parameters in ~$@~, though ~partgrator-installer~ stores the parameters in an exported variable for simplifying this workaround), this way the shell waits until the closure of the compound-list in order to start interpreting its content (the whole file + an extra ~kill~).
+
+   Second, for preventing the plain ~cat~ from waiting for input after the script has finished, the solution is to interrupt such ~cat~ at the end of the script (enclosed in a compound-list or function, and piped into a shell). This can be achieved by launching inside a shell (~sh~) the plain ~cat~ with an ~exec~ as last command after the other ~cat~ that outputs the content of ~partgrator-installer~ + ~echo~ in between enclosing the installer in a wrapper + ~echo~ a ~kill~ command with the current process id (~$$~) into the piped shell.
+
+   Third, the user's input needs to be held until the piped shell has started interpreting the installer (passed as input), otherwise the user input would be included into what's passed to the piped shell, mixing with the content of the installer (and generating syntax errors). This is simply done by waiting (~sleep~) until the piped shell starts outputting, then interrupting the ~sleep~ and passing the input into the piped shell (~cat~). This whole process is implemented in the innermost shell, sending the pid (~$$~) into stderr (before sending the content of the installer into the piped shell followed by ~sleep~), intercepted by the last chain (~read~), which waits for the output of the piped shell (~sed~), interrupting the ~sleep~ afterwards (~kill~). Finally, after the ~sleep~, a ~cat~ is executed, reading the user input and sending it into the piped shell (which is interpreting the installer code and accepting user-input), and, simultaneously, the ~kill~ from the last chain moved into another ~cat~, presenting the output of the piped shell to the user.
+
+   It shall be noted that redirecting stderr into stdout (~2>&1~) is used because ~logger~ only outputs into the terminal if run with the -s flag, and its output goes to stderr, that's also the reason regarding redirecting again the output of the last chain to stderr (preserving the original expected behavior, probably chosen like that in ~logger~'s implementation because stderr is generally unbuffered).
+
+   It is perfectly possible to separate stdout from stderr (if ~logger~ would output to stdout instead of stderr, which is not the case), the only modifications to do in the workaround are: change the ~2>&1~ in the compound-list to ~3>&1~ (duplicate stdout in file descriptor 3); send the innermost shell pid into file descriptor 3 instead of stderr (~echo \\\$\\\$ >&3~); and remove last-chain stdout into stderr redirection (~>&2~).
+
+   I see that the previous explanation is really confusing, in a nutshell: three shells are spawned, the purpose of the last two is to be replaced by another command executed (last) in them (launched with ~exec~) after having passed their pid to a different pipe-chain so that, after specific events, these commands from the first chain can interrupted (~kill~) from other chain, and also, in these two last shells, the installer file is piped (~cat~, enclosed in a list+subshell using ~echo~) to another shell for it to interpret it.
+
+   This is the command:
+   #+begin_src sh
+     exec sh -c '  {   sh -c "sh -c \"echo \\\$\\\$ >&2                         ; \
+                                      echo \{ \(                                ; \
+                                      cat        "'"${installer}"'"             ; \
+                                      echo                          \)     \;   ; \
+                                      echo    kill -s INT \$\$ 2\>/dev/null\; \}; \
+                                      exec sleep 999                             \" ; \
+                              exec cat                                                "   \
+                     | sh                                                               ; } 2>&1 \
+                 | ( read pid; sed "q"; kill -s INT ${pid}; \
+                     trap "" EXIT KILL QUIT INT;   exec cat ) >&2                                '
+   #+end_src
+
+   [[https://github.com/caribpa/partgrator/blob/master/partgrator-installer#L306][Code link]].
+
+   In case the main workaround is unable to run (shouldn't happen) there are two fallback attempts (actually they were the first attempts for this workaround).
+
+   In the first fallback attempt partgrator checks if it can be run inline from another shell. This check is important because the installer + arguments may surpass the allowed string size (~MAX_ARG_STRLEN~) that can be used as a parameter in a command: ~sh -c <commands as parameter in string>~
+
+   If no error is returned, then it is run by replacing the currently running process with ~exec~:
+   #+begin_src sh
+     # sed is used to remove the '# EOF' at the end of the partgrator-installer file
+     exec sh -c "_wrap(){ $(sed '$d' "${installer}"); }; _wrap ${parameters}"
+   #+end_src
+
+   [[https://github.com/caribpa/partgrator/blob/master/partgrator-installer#L328][Code link]].
+
+   If an error was returned in the check, then the installer is simply copied into ~/tmp~ (or whatever the variable ~$tmp~ is set to) and executed from there with ~exec~:
+   #+begin_src sh
+     cp -p -- "${installer}" "${tmp_installer}"
+     run_from_file=1 exec sh "${tmp_installer}" ${parameters}
+   #+end_src
+
+   [[https://github.com/caribpa/partgrator/blob/master/partgrator-installer#L340][Code link]].
+
+   The ~$run_from_file~ flag forces the file to skip the /relaunch from memory/ check. Setting this variable should be reserved as a last-resort attempt.
+
+   If copying into ~$tmp~ and running from it fails, using this variable will be given to the user as a choice.
+
+   Copying to ~$tmp~ is left as a fallback because the user may have changed the value of the variable, thus the file may be copied into a non-temporary location. Also because copying into ~/tmp~ uses RAM (138K), and there is a small chance the user will need that space during the ~usb-creator~ procedure (running ~partgrator-installer~ without parameters run ~install~ followed by ~usb-creator~).
+
+* Improvements (TO-DOs)
+  - [ ] Split the content of this README into a Wiki
+  - [ ] Implement the major changes stated in [[https://github.com/caribpa/partgrator/issues/1][issue 1]] processing multi-main-partgrator-partitions natively
+  - [ ] Replace the non-POSIX Shell variable substring processing parameter expansion (see [[#Busyboxs-ash-specific-1251---aarch64][Busybox specific]]) with their equivalent using ~awk~, ~sed~, and ~tr~
+  - [ ] Prettify ~partgrator-installer~ UI and output
+  - [ ] Make more consistent ~partgrator-installer~ logfile spacing
+  - [ ] Allow to customize the filesystem attributes and mount options in ~partgrator-installer~ ~usb-creator~
+  - [ ] Allow to define the number of partitions ~partgrator-installer~ ~usb-creator~ creates (example: 3 partitions instead of 2), allowing to select the main partgrator partition (or partitions)
+  - [ ] Allow to specify a device (instead of answering the prompt) in ~partgrator-installer~ ~usb-creator~
+  - [ ] Process journal-options
+  - [ ] Process extended filesystem features other than extended mount options (not implemented due to them being likely out of the Asuswrt-Merlin-usage scope)
+  - [ ] Rethink the /Main subshell/ approach of ~partgrator-post~
+  - [ ] Unify all the user variables into a file to allow easy customization
+  - [ ] Make more consistent environment variables and optional function variables usage
+  - [ ] Use conditionals more consistently
+  - [ ] Provide a wrapper function/examples about how to override the [[#System-specific-utilities][system specific utilities]] as mentioned in the [[#Out-of-RAM-when-creating-a-device-with-the-usb-creator-wizard][out of RAM]] troubleshoot
+  - [ ] Unify the remaining almost-duplicated code in ~partgrator-installer~ ~usb-creator~ and ~partgrator-helpers~
+  - [ ] All the TODO comments with minor improvements stated in the scripts
+
+* Changelog
+  - 1.0.0 - Initial Release
+
+* Author
+  Carlos Ibáñez ([[https://github.com/caribpa][caribpa]])
+
+* Copyright and License
+  Copyright 2020 [[https://github.com/caribpa][caribpa]]
+
+  Partgrator is free to use under the [[https://spdx.org/licenses/Artistic-2.0.html][Artistic License 2.0]]

@@ -1,0 +1,1125 @@
+#!/bin/sh
+
+# partgrator-post version 1.0.0
+#
+# partgrator-post migrates, recovers, unmounts, and ejects detected partgrator devices
+#
+# For more information, issues, or assistance visit: https://github.com/caribpa/partgrator
+#
+# Author: caribpa (https://github.com/caribpa)
+#
+# Copyright 2020 caribpa
+#
+# partgrator-post is free to use under the Artistic License 2.0
+#
+# Find the Artistic License 2.0 here: https://spdx.org/licenses/Artistic-2.0.html
+
+
+########### USER VARIABLES ###########
+
+partgrator_dir="/jffs/addons/partgrator"    # Partgrator installation directory path
+
+                                    # A migration will be performed when the error code
+                                    # returned by disk-check is in the min-max range of:
+min_error_code=4                    # Minimum error code returned by disk-check
+max_error_code=31                   # Maximum error code returned by disk-check
+
+ eject_code=2                       # disk-check error code requiring ejecting the device
+
+force_eject=0                       # Boolean toggling force ejecting mounted partitions
+
+experimental_partition_reprocess=0  # Boolean toggling the experimental reprocessing of
+                                    # the caller partition in case a partgrator partition
+                                    # was already used by another main partition in a
+                                    # prior execution of this script
+
+tar_exclude="#############################################################################
+             #
+             #   < Files and directories excluded by tar when performing a migration >
+             #
+             #############################################################################
+             #
+             # > Put one file or directory per line, or separated by a newline keyword: \n
+             # > Comments must be on their own line and start with #
+             # > Empty lines or lines with only spaces or tabs will be deleted
+             #
+             # > As tar doesn't distinguish files from directories (adding a trailing
+             # > slash to the pattern won't match anything; you can use a * wildcard after
+             # > the slash to exclude everything inside), I'll refer to both files and
+             # > directories when using the world 'file' in the rest of this description
+             #
+             # > POSIX Wildcards (glob) are supported
+             # > Escape the wildcard symbols with \ when you want to match them literally
+             # > Double quotes and symbols interpreted by the shell also need escaping
+             # > Prefix ./ to match files only on the mountpoint's root folder
+             #
+             # > Examples:
+             #   > Exclude a file inside a specific folder from the root: ./path/to/file
+             #   > Exclude a file anywhere but related to a hierarchy:      path/to/file
+             #   > Exclude a folder's content anywhere:                     folder/*
+             #   > This WON'T exclude a folder (nor a file) anywhere:       folder/
+             #
+             # > Consult -X or --exclude in busybox tar's manual for more information
+             #
+             #############################################################################
+
+             ./.minidlna
+             ./lost+found
+
+             #############################################################################
+             #
+             # > IMPORTANT: Setting the variable in the environment takes precedence
+             # >            over this variable. So none of the previously listed files
+             # >            will be excluded if you don't explicitly add them.
+             #
+             # >            You may use a \n between files to simulate new lines:
+             # >            tar_exclude='./.minidlna\n./lost+found'
+             #
+             ############################################################################"
+
+
+######################################
+###                               ####
+###  USERS DO NOT NEED TO MODIFY  ####
+###       BELOW THIS POINT        ####
+###                               ####
+######################################
+
+
+(  # Beginning of main subshell
+
+# TODO - Consider putting everything inside a "main" function and declare every variable
+#      as local instead of using a subshell
+
+########### SHELL VARIABLES ##########
+
+LC_ALL=C
+  PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+
+########## GLOBAL VARIABLES ##########
+
+   migration_started=0     # Values: 0 -> false ; 1 -> pre-starting ; 2 -> true
+
+          mountpoint="$1"
+
+revert_rename_failed=100   # Error code to signal a failure when reverting renaming
+
+       eject_devices=''    # List of devices to be ejected after being processed
+
+   tar_exclude_clean="$(  printf -- '%s' "${tar_exclude}"                         \
+                        | sed 's/^[[:space:]]*//;/^#/d;s/[[:space:]]*$//;/^$/d;
+                               s/%/\\%/g                                        ' )"
+
+        tools_needed="[
+                      awk
+                      cat
+                      df
+                      echo
+                      expr
+                      false
+                      grep
+                      mkdir
+                      mount
+                      printf
+                      rm
+                      sed
+                      swapoff
+                      sync
+                      tar
+                      touch
+                      tune2fs"
+
+                 IFS=$'\n' # Change IFS so that the tools and loops works as expected
+
+
+############## HELPERS ###############
+
+get_last_mountpoint() (
+    local  partition="$1"
+
+    local mountpoint=''
+
+    local   ret_code=0
+
+    set -o pipefail
+
+    log_msg "Retrieving ${partition} last mountpoint"
+
+       mountpoint="$(  tune2fs -l "${partition}"               \
+                     | sed -n '/^Last mounted on: */{s///p;q}' )"          \
+    || { ret_code=$?
+         log_msg -p error "tune2fs failed with error code ${ret_code}"   \
+                          "when retrieving ${partition} last mountpoint"
+         return ${ret_code}                                              ; }
+
+       [ "${mountpoint}" = "<not available>" ]                                \
+    && { log_msg -p error "${partition} has no record of a last mountpoint"
+         return 1                                                           ; }
+
+    echo "${mountpoint}"
+
+    log_msg "${partition} last mountpoint was retrieved successfully"
+
+    return 0
+)
+
+mount_partition() {
+    local  partition="$1"
+
+    local mountpoint="$2"
+
+    local   ret_code=0
+
+    log_msg "Mounting ${partition} into ${mountpoint}"
+
+       grep -q "${mountpoint}" "${mtab}"                                            \
+    && { log_msg -p error "Another partition is already mounted in ${mountpoint}"
+         return 1                                                                 ; }
+
+       [ ! -d "${mountpoint%/*}" ]                                                   \
+    && { log_msg -p error "Parent folder ${mountpoint%/*} does not exit, canceling"
+         return 2                                                                  ; }
+
+       mkdir -p "${mountpoint}"                                                       \
+    || { ret_code=$?
+         log_msg -p error "mkdir failed with error code ${ret_code} when trying to" \
+                          "create ${mountpoint}"
+         return ${ret_code}                                                         ; }
+
+       mount "${partition}" "${mountpoint}"                                           \
+    || { ret_code=$?
+         log_msg -p error "mount failed with error code ${ret_code} when trying to" \
+                          "mount ${partition} into ${mountpoint}"
+         return ${ret_code}                                                         ; }
+
+    log_msg "${partition} was mounted into ${mountpoint} successfully"
+
+    return 0
+}
+
+clone_mountpoint() (
+    local orig_mountpoint="$1"
+    local dest_mountpoint="$2"
+    local        ret_code=0
+
+    set -o pipefail
+
+    log_msg "Cloning data"            \
+            "from ${orig_mountpoint}" \
+            "into ${dest_mountpoint}"
+
+    # Cloning using tar and excluding ${partgrator_file}, .__ files, and user files
+      { echo "./${partgrator_file}"
+        echo './.__*'
+        printf -- "${tar_exclude_clean}" ; }   \
+    | tar -cf - -C "${orig_mountpoint}" -X - . \
+    | tar -xf - -C "${dest_mountpoint}"
+    ret_code=$?
+
+    if [ ${ret_code} -ne 0 ]; then
+        # TODO - Provide a way for handling tar errors better
+        log_msg -p error "tar failed with error code ${ret_code} when migrating data" \
+                         "from ${orig_mountpoint}"                                    \
+                         "into ${dest_mountpoint}"
+    else
+        log_msg "Data cloning from ${orig_mountpoint}" \
+                             "into ${dest_mountpoint}" \
+                "was completed successfully!"
+    fi
+
+    sync
+    return ${ret_code}
+)
+
+disable_mountpoint_swapfiles() {
+    local      mountpoint="$1"
+
+    local        swapfile=''
+    local       swapfiles=''
+    local cannot_allocate=0
+
+    local        ret_code=0
+
+    log_msg "Detecting ${mountpoint} active swapfiles"
+
+    # This double subshell is needed in case the swapfiles contain spaces or symbols as
+    # they are represented in octal in ${proc_swaps} and printf converts them into text
+    # Also escaping all the ${mountpoint} (mp) punctuation with gsub before matching
+       swapfiles="$(printf "$(awk 'BEGIN{mp="'${mountpoint}'";         \
+                                         gsub(/[[:punct:]]/,"\\\\&",mp)} \
+                                   ($0 ~ "^"mp){print $1}                ' \
+                                  "${proc_swaps}"                          )" )" \
+    || { ret_code=$?
+         log_msg -p error "awk failed with error code ${ret_code}" \
+                          "when processing ${proc_swaps}"
+         return ${ret_code}                                        ;             }
+
+       [ -z "${swapfiles}" ]                                             \
+    && { log_msg "No active swapfiles found in ${mountpoint}"; return 0; }
+
+    log_msg "${mountpoint} contains active swapfiles"
+
+    for swapfile in ${swapfiles}; do
+        log_msg "Disabling ${swapfile}"
+
+           cannot_allocate="$(  swapoff -- "${swapfile}" 2>&1        \
+                              | awk 'tolower($0) ~ "cannot allocate"')" \
+        && { log_msg "${swapfile} disabled successfully";            :; } \
+        || { ret_code=$?
+             log_msg -p error "swapoff failed with error code" \
+                              "${ret_code} when disabling"     \
+                              "swapfile ${swapfile}"
+
+                [ -n "${cannot_allocate}" ]                  \
+             && log_msg -p error "Unable to allocate enough" \
+                                 "memory (RAM) to disable"   \
+                                 "${swapfile}"
+             return ${ret_code}                              ;            }
+    done
+
+    log_msg "${mountpoint} swapfiles successfully disabled"
+
+    return 0
+}
+
+rename_partition() {
+    local  partition="$1"
+    local  new_label="$2"
+    local try_revert="$3"  # Hidden parameter to prevent infinite recursion
+
+    local orig_label="$(  tune2fs -l "${partition}"                      \
+                        | sed -n '/^Filesystem volume name: */{s///p;q}' )"
+
+    local   ret_code=0
+
+    log_msg "Renaming ${partition} (${orig_label})" \
+            "to ${new_label}"
+
+    # Note - This works even on mounted filesystems
+    #        There is no alternative for non ext filesystems without reformatting
+    tune2fs -L "${new_label}" "${partition}"
+    ret_code=$?
+
+    if [ ${ret_code} -ne 0 ]; then
+        log_msg -p error "tune2fs failed with error code ${ret_code} when" \
+                         "renaming" "${orig_label}"                        \
+                         "into"     "${new_label}"                         \
+                         "on"       "${partition}"
+
+        if [ "${try_revert}" != "no" ]; then
+            log_msg "Reverting renaming"
+            if rename_partition "${partition}" "${orig_label}" "no"; then
+                log_msg "Changes successfully reverted"   \
+                        "in ${partition} (${orig_label})"
+            else
+                log_msg -p error "Unable to revert renaming"       \
+                                 "in ${partition} (${orig_label})"
+
+                log_msg -p error "${partition} left with the wrong label."        \
+                                 "The system may be unable to work as expected."  \
+                                 "Manual intervention is required for renaming"   \
+                                 "${partition} (${new_label}) into ${orig_label}"
+                return ${revert_rename_failed}
+            fi
+        fi
+    fi
+    sync
+    return ${ret_code}
+}
+
+migrate_partgrator_file() {
+    local orig_mountpoint="$1"
+    local dest_mountpoint="$2"
+
+    local  orig_partition=''
+
+    local        ret_code=0
+
+    log_msg "Migrating ${partgrator_file}" \
+            "from ${orig_mountpoint}"      \
+            "into ${dest_mountpoint}"
+
+       orig_partition="$(get_mountpoint_partition "${orig_mountpoint}")" \
+    || return $?
+
+       echo "${orig_partition}" > "${dest_mountpoint}/${partgrator_file}"  \
+    || { ret_code=$?
+         log_msg -p error "echo failed with error code ${ret_code} when" \
+                          "trying to create ${partgrator_file}"          \
+                          "into ${dest_mountpoint}"
+         return ${ret_code}                                              ; }
+
+       rm -- "${orig_mountpoint}/${partgrator_file}"                     \
+    || { ret_code=$?
+         log_msg -p error "rm failed with error code ${ret_code} when" \
+                          "trying to remove ${partgrator_file}"        \
+                          "from ${orig_mountpoint}"
+         return ${ret_code}                                            ; }
+    sync
+
+    log_msg "${partgrator_file} migration completed successfully"
+
+    return 0
+}
+
+# Returns a boolean true (0) or false (1) if a partgrator partition is mounted
+# as the mountpoint passed to this script ($1) or if the mountpoint is unmounted
+is_partgrator() {
+    local partition=''
+    local     label=''
+
+    local  ret_code=0
+
+       partition="$(get_mountpoint_partition "${mountpoint}")" \
+    || { ret_code=$?
+         [ ${ret_code} -eq ${not_found_code} ] && return 0
+         return ${ret_code}                                  ; }
+
+       label="$(get_partition_label "${partition}")" \
+    || return $?
+
+    ! case "${label}" in "${partgrator_label}"*) false;; esac
+    return $?
+}
+
+recover_partitions() {
+    local     partition_status_lines=''
+
+    local  partition_remaining_lines=''
+    local  partition_processed_lines=''
+    local    partition_updated_lines=''
+    local     partition_delete_lines=''
+
+    local             partition_line=''
+    local            partgrator_line=''
+
+    local            partition_label=''
+    local partgrator_partition_label=''
+
+    local                  partition=''
+    local       partgrator_partition=''
+
+    local       partition_mountpoint=''
+    local      partgrator_mountpoint=''
+
+    local         partition_ret_code=0
+    local        partgrator_ret_code=0
+
+    local        partition_used_size=''
+    local       partgrator_used_size=''
+
+    local                      regex=''
+    local                   ret_code=0
+
+    log_msg "Starting partition recovery"
+
+    log_msg "Checking if the last migration process was interrupted"
+
+    while :; do
+        # TODO - For efficiency purposes this line and the $partition_processed_lines
+        #      right below should go in a wrapper loop around this while that breaks if
+        #      processed_lines was unchanged
+        partition_remaining_lines="$(grep -v                                            \
+                                          "^${partition_processed_lines//${IFS}/\$\|^}$"\
+                                          "${partitions_status}"                        )"
+
+        [ -z "${partition_remaining_lines}" ] && break
+
+                   partition_line="${partition_remaining_lines%%${IFS}*}"
+
+
+        # The trailing $'\n' is needed for matching in the line after the following
+        partition_remaining_lines="${partition_remaining_lines}"$'\n'
+
+        # The leading $'\n' is needed for ${partition_status_lines} assignment below
+        partition_remaining_lines=$'\n'"${partition_remaining_lines#*${IFS}}"
+
+
+        # Add the current line to the variable with all the unchanged processed lines
+        partition_processed_lines="${partition_processed_lines}"$'\n'"${partition_line}"
+
+        # Trimming leading newline
+        partition_processed_lines="${partition_processed_lines#${IFS}}"
+
+
+        # Variable used to find duplicated labels (see the expr below)
+           partition_status_lines="${partition_updated_lines}${partition_remaining_lines}"
+
+        # Add the current line to the variable with all the changed processed lines
+          partition_updated_lines="${partition_updated_lines}"$'\n'"${partition_line}"
+
+        # Trimming leading newline
+          partition_updated_lines="${partition_updated_lines#${IFS}}"
+
+
+                  partition_label="${partition_line#*:}"
+                        partition="${partition_line%% *}"
+
+             partition_mountpoint="$(get_partition_mountpoint "${partition}")" \
+        || continue
+
+        if ! case "${partition_label}" in "${partgrator_label}"*) false ;; esac; then
+               partgrator_partition="$(cat "${partition_mountpoint}/${partgrator_file}"\
+                                            2> /dev/null                               )"\
+            && {    partgrator_mountpoint="$(get_partition_mountpoint            \
+                                                        "${partgrator_partition}")"      \
+                 || { # The partition inside ${partgrator_file} may be wrong due to a
+                      # `reload_devices` call that changed the device descriptor's name
+
+                      # This regex yields a path like: /dev/sd[a-z]*1
+                      # Where the last 1 is taken from the partition number in
+                      # ${partgrator_file}
+                      regex="${partgrator_partition%/*}/sd[a-z]*"
+                      regex="${regex}${partgrator_partition##*[a-z]}"
+
+                      # Try to find a mounted partition that is not the current one
+                      for partgrator_mountpoint in $(awk '/^'${regex//\//\\\/}' / \
+                                                          {print $2}              ' \
+                                                         "${mtab}"                  )
+                      do
+                            [ "${partgrator_mountpoint}" = "${partition_mountpoint}" ] \
+                         && { partgrator_mountpoint=''
+                              continue                                             ; }
+                      done
+                      [ -z "${partgrator_mountpoint}" ] && continue                    ; }
+
+                 log_msg -p warning "Found a ${partgrator_file} inside the"       \
+                                    "${partition_label} (${partition}) partition"
+
+                    migrate_partgrator_file "${partition_mountpoint}"  \
+                                            "${partgrator_mountpoint}" \
+                 || break                                              ;                 }
+            continue
+        fi
+
+        # Detect line with duplicated label
+           partgrator_line="$(expr "${partition_status_lines}" :                       \
+                               ".*"$'\n'"\([^"$'\n'"]*:${partition_label}[^"$'\n'"]*\)")"\
+        && { partgrator_partition_label="${partgrator_line#*:}"
+
+             [ "${partition_label}" != "${partgrator_partition_label}" ] && continue
+
+             partgrator_partition="${partgrator_line%% *}"
+
+             # Continue if the partitions are from different devices
+             [ "${partition%%[1-9]*}" != "${partgrator_partition%%[1-9]*}" ] && continue
+
+                partgrator_mountpoint="$(get_partition_mountpoint               \
+                                                       "${partgrator_partition}")" \
+             || continue
+
+             log_msg -p warning "Found duplicated labels in ${partition} and"  \
+                                "${partgrator_partition}, performing recovery"
+
+             if    [ -f  "${partition_mountpoint}/${partgrator_file}" ] \
+                && [ -f "${partgrator_mountpoint}/${partgrator_file}" ]
+             then
+                  partition_ret_code="$(expr  "${partition_line}" : '[^ ]* \([0-9]*\)')"
+                 partgrator_ret_code="$(expr "${partgrator_line}" : '[^ ]* \([0-9]*\)')"
+
+                 if      {   [  ${partition_ret_code} -lt ${min_error_code} ] \
+                          || [  ${partition_ret_code} -gt ${max_error_code} ] ; } \
+                      && {   [ ${partgrator_ret_code} -gt ${min_error_code} ] \
+                          || [ ${partgrator_ret_code} -lt ${max_error_code} ] ; }
+                 then
+                     log_msg "Removing duplicated ${partgrator_file}" \
+                             "in ${partgrator_partition}"
+                        rm -- "${partgrator_mountpoint}/${partgrator_file}"              \
+                     || { log_msg -p error "rm failed with error code $? when removing"  \
+                                           "${partgrator_mountpoint}/${partgrator_file}"
+                          log_msg -p warning "Check that ${partgrator_partition} wasn't" \
+                                             "mounted read-only"                       ; }
+                 elif    {   [  ${partition_ret_code} -gt ${min_error_code} ] \
+                          || [  ${partition_ret_code} -lt ${max_error_code} ] ; } \
+                      && {   [ ${partgrator_ret_code} -lt ${min_error_code} ] \
+                          || [ ${partgrator_ret_code} -gt ${max_error_code} ] ; }
+                 then
+                     log_msg "Removing duplicated ${partgrator_file}" \
+                             "in ${partition}"
+                        rm -- "${partition_mountpoint}/${partgrator_file}"               \
+                     || { log_msg -p error "rm failed with error code $? when removing"  \
+                                           "${partition_mountpoint}/${partgrator_file}"
+                          log_msg -p warning "Check that ${partition} wasn't" \
+                                             "mounted read-only"              ;          }
+                 elif [ ${partition_ret_code} -lt ${partgrator_ret_code} ]; then
+                     log_msg "Removing duplicated ${partgrator_file}" \
+                             "in ${partgrator_partition}"
+                        rm -- "${partgrator_mountpoint}/${partgrator_file}"              \
+                     || { log_msg -p error "rm failed with error code $? when removing"  \
+                                           "${partgrator_mountpoint}/${partgrator_file}"
+                          log_msg -p warning "Check that ${partgrator_partition} wasn't" \
+                                             "mounted read-only"                       ; }
+                 elif [ ${partition_ret_code} -gt ${partgrator_ret_code} ]; then
+                     log_msg "Removing duplicated ${partgrator_file}" \
+                             "in ${partition}"
+                        rm -- "${partition_mountpoint}/${partgrator_file}"               \
+                     || { log_msg -p error "rm failed with error code $? when removing"  \
+                                           "${partition_mountpoint}/${partgrator_file}"
+                          log_msg -p warning "Check that ${partition} wasn't" \
+                                             "mounted read-only"              ;          }
+                 else
+                     # Return codes are the same
+
+                     # TODO - Maybe add a variable that disables the size comparison
+                     #      and cancels the recovery instead
+                        partition_used_size="$(set -o pipefail;                      \
+                                                 df -k -- "${partition}"             \
+                                               | awk '{if(NR != 1){print $3; exit}}' )" \
+                     || { ret_code=$?
+                          log_msg -p error "df failed with error code ${ret_code}"  \
+                                           "when retrieving ${partition} used size" ;   }
+                        partgrator_used_size="$(set -o pipefail;                      \
+                                                  df -k -- "${partgrator_partition}"  \
+                                                | awk '{if(NR != 1){print $3; exit}}' )" \
+                     || { ret_code=$?
+                          log_msg -p error "df failed with error code ${ret_code}"   \
+                                           "when retrieving ${partgrator_partition}" \
+                                           "used size"                               ;   }
+
+                     if [ ${ret_code} -ne 0 ]; then
+                         if [ ${partition_used_size} -gt ${partgrator_used_size} ]; then
+                             log_msg "Removing duplicated ${partgrator_file}" \
+                                     "in ${partgrator_partition}"
+                                rm -- "${partgrator_mountpoint}/${partgrator_file}"      \
+                             || { log_msg -p error "rm failed with error code $?"        \
+                                                   "when removing"                       \
+                                           "${partgrator_mountpoint}/${partgrator_file}"
+                                  log_msg -p warning "Check that ${partgrator_partition}"\
+                                                     "wasn't mounted read-only"        ; }
+                         else
+                             # ${partition_used_size} <= ${partgrator_used_size}
+                             log_msg "Removing duplicated ${partgrator_file}" \
+                                     "in ${partition}"
+                                rm -- "${partition_mountpoint}/${partgrator_file}"       \
+                             || { log_msg -p error "rm failed with error code $?"        \
+                                                   "when removing"                       \
+                                            "${partition_mountpoint}/${partgrator_file}"
+                                  log_msg -p warning "Check that ${partition} wasn't" \
+                                                      "mounted read-only"             ;  }
+                         fi
+                     else
+                         ret_code=0
+                     fi
+                 fi
+             fi
+
+             # ${partgrator_line} is being processed so no need in doing it again later
+                expr $'\n'"${partition_processed_lines}"$'\n' :
+                     ".*"$'\n'"${partgrator_line}"$'\n'       > /dev/null                \
+             || { partition_processed_lines="${partition_processed_lines}"$'\n'
+                  partition_processed_lines="${partition_processed_lines}${partgrator_line}"
+                  partition_updated_lines="${partition_updated_lines}"$'\n'
+                  partition_updated_lines="${partition_updated_lines}${partgrator_line}";}
+
+             if   [ -f "${partition_mountpoint}/${partgrator_file}" ]; then
+                 rename_partition "${partgrator_partition}" "${partgrator_label}"
+
+                 # Update the label of ${partgrator_line}
+                 partition_updated_lines="${partition_updated_lines/"${partgrator_line//\//\\\/}"/"${partgrator_line/${partition_label}/${partgrator_label}}"}"
+             elif [ -f "${partgrator_mountpoint}/${partgrator_file}" ]; then
+                 rename_partition "${partition}" "${partgrator_label}"
+
+                 # Update the label of ${partgrator_line}
+                 partition_updated_lines="${partition_updated_lines/"${partition_line//\//\\\/}"/"${partition_line/${partition_label}/${partgrator_label}}"}"
+             else
+                 log_msg -p warning "${partition} and ${partgrator_partition} have" \
+                                    "the same labels but none of them have a"       \
+                                    "${partgrator_file}"
+                 continue
+             fi
+             stop_services
+
+             # Needs to be called with the second parameter as ${partition} may not be
+             # found in the ${mtab} after being renamed
+             unmount_mountpoint "${partition_mountpoint}" "${partition}"
+
+             # ${partgrator_mountpoint} (next duplicated label) can only be unmounted if
+             # there are no more duplicated labels in the new ${partition_status_lines}
+                expr "${partition_status_lines}"$'\n' :                                 \
+                     ".*"$'\n'"${partgrator_line}"$'\n'"[^:]*:${partition_label}"$'\n'  \
+                                                                            > /dev/null \
+             || unmount_mountpoint "${partgrator_mountpoint}" "${partgrator_partition}"
+
+             partition_delete_lines="${partition_delete_lines}"$'\n'"${partition_line}"
+             partition_delete_lines="${partition_delete_lines}"$'\n'"${partgrator_line}"
+
+             # Trimming leading newline
+             partition_delete_lines="${partition_delete_lines#${IFS}}"
+
+             # Add the current device to ${eject_devices} if it is not already there
+                expr "${eject_devices}" : ".*${partition%%[1-9]*} *" > /dev/null \
+             || eject_devices="${eject_devices} ${partition%%[1-9]*}"            ;       }
+    done
+
+    if [ -n "${eject_devices}" ]; then
+                         regex=${partition_delete_lines//\//\\\/}
+                         regex="${regex//${IFS}/\$\\|^}"
+
+        partition_status_lines="$(sed '/^'${regex}'$/d' "${partitions_status}")"
+
+        printf '%s' "${partition_status_lines}${partition_status_lines:+${IFS}}" \
+               > "${partitions_status}"
+
+        log_msg "Recovery was completed successfully"
+        exit
+    fi
+
+    log_msg "Nothing to recover"
+
+    log_msg "Finished partition recovery"
+
+    return 0
+}
+
+migrate_partitions() {
+    local     partition_status_lines=''
+
+    local            partition_lines=''
+    local           partgrator_lines=''
+
+    local             partition_line=''
+    local            partgrator_line=''
+
+    local            partition_label=''
+    local partgrator_partition_label=''
+
+    local                  partition=''
+    local       partgrator_partition=''
+
+    local       partition_mountpoint=''
+    local      partgrator_mountpoint=''
+
+    local         partition_ret_code=0
+    local        partgrator_ret_code=0
+
+    local            processed_lines=''
+    local partgrator_processed_lines=''
+    local  partition_processed_lines=''
+
+    local     unprocessed_partitions=''
+
+    local                      regex=''
+
+    local                        IFS=$'\n'
+
+    local                   ret_code=0
+
+    log_msg "Starting partition migration"
+
+    log_msg "Checking if the partitions need to be migrated"
+
+    partition_status_lines="$(cat "${partitions_status}")"
+
+    # These two for loops allow processing partitions in the case that each of them have a
+    # partgrator partition and need a migration.
+    # TODO - Improve when having more than one main-partition in the same device
+    # TODO - Try to perform the filtering without a pipe
+    #      The only way seems to be with expr but it only matches one line at a time:
+    #          expr "${partition_status_lines}" :                      \
+    #               '.*'$'\n''\([^'$'\n'']* :_partgrator[^'$'\n'']*\).*'
+    #      & having to add or remove leading/trailing: .*"$'\n'" to match different lines
+    partgrator_lines="$(  echo "${partition_status_lines}" \
+                        | grep -- " :${partgrator_label}"  )"
+
+    partition_processed_lines=''
+
+    # TODO - Maybe this loop should be converted into a while -n like recover_partitions
+    for partgrator_line in ${partgrator_lines}; do
+              partgrator_partition="${partgrator_line%% *}"
+        partgrator_partition_label="${partgrator_line#*:}"
+
+        # Finds lines where the partition has the same base name but different number
+        # (Ex: /dev/sda2) than the partgrator partition (Ex: /dev/sda1)
+        regex="^${partgrator_partition%%[0-9]*}"
+        regex="${regex}[^${partgrator_partition##*[a-z]}a-z][0-9]* "
+
+        # TODO - Try to perform the filtering without a pipe
+        #      The only way seems to be with expr but it only matches one line at a time:
+        #          expr "${partition_status_lines}" :                          \
+        #               ".*"$'\n'"\(/dev/sda[^1a-z][0-9]*[^"$'\n'"]*\)"$'\n'""
+        #      but using:
+        #          ${partgrator_partition%%[0-9]*}[^${partgrator_partition##*[a-z]}a-z]
+        #      & having to add or remove leading/trailing: .*"$'\n'" to match
+        #      different lines
+        partition_lines="$(  echo "${partition_status_lines}"                         \
+                           | awk  "/"${regex//\//\\\/}"/ && !/ :${partgrator_label}/" )"
+        for partition_line in ${partition_lines}; do
+                       partition="${partition_line%% *}"
+                 partition_label="${partition_line#*:}"
+            partition_mountpoint="$(get_partition_mountpoint "${partition}")"
+              partition_ret_code="$(expr "${partition_line}" : '[^ ]* \([0-9]*\)')"
+
+               [ -z "${partition_mountpoint}"            ]                         \
+            && [ ${partition_ret_code} -ne ${eject_code} ]                         \
+            && { log_msg -p warning "${partition} (${partition_label}) is still" \
+                                    "not mounted"
+                 log_msg -p warning "Skipping ${partition}"
+                 continue                                                        ; }
+
+            # Mark the line as processed
+            partition_processed_lines="${partition_processed_lines}"$'\n'
+            partition_processed_lines="${partition_processed_lines}${partition_line}"
+
+               [ ! -f "${partition_mountpoint}/${partgrator_file}" ] \
+            || [       ${partition_ret_code} -lt ${min_error_code} ] \
+            || [       ${partition_ret_code} -gt ${max_error_code} ] \
+            && [       ${partition_ret_code} -ne ${eject_code}     ] \
+            && continue
+
+               # Add the current device to ${eject_devices} if it is not already there
+               expr "${eject_devices}" : ".*${partition%%[1-9]*} *" > /dev/null \
+            || eject_devices="${eject_devices} ${partition%%[1-9]*}"
+
+            if [ ${partition_ret_code} -eq ${eject_code} ]; then
+               log_msg "${partition} (${partition_label}) was fixed by fsck and"         \
+                       "requires to be ejected for it to be properly used by the system"
+               continue
+            fi
+
+            migration_started=2
+
+            log_msg -p warning "${partition} (${partition_label}) needs to be migrated"
+
+               partgrator_mountpoint="$(get_partition_mountpoint                 \
+                                                        "${partgrator_partition}")" \
+            && { stop_services || break
+                   unmount_mountpoint "${partgrator_mountpoint}" \
+                                      "${partgrator_partition}"  \
+                 || break                                        ;                  }
+
+               [ -z "${partgrator_mountpoint}" ]                                        \
+            && partgrator_mountpoint="$(get_last_mountpoint "${partgrator_partition}")"
+
+               format_partition "${partgrator_partition}" "${partition}" \
+                                "${partgrator_partition_label}"          \
+            || continue
+
+               [ -n "${partgrator_mountpoint}" ]                                    \
+            && mount_partition "${partgrator_partition}" "${partgrator_mountpoint}"      \
+            || { log_msg -p warning "Trying to automatically mount" \
+                                    "${partgrator_partition}"
+
+                 reload_disks
+                 log_msg "Note that a new instance of this script will be executed"     \
+                         "with ${partgrator_partition} (${partgrator_partition_label})" \
+                         "mountpoint as parameter"
+
+                    partgrator_mountpoint="$(wait_partition_mountpoint             \
+                                                         "${partgrator_partition}" )" \
+                 || { log_msg -p warning "Cancelling migration"
+                      continue                                                      ; }; }
+
+            stop_services                                           || continue
+
+            kill_mountpoint_processes    "${partgrator_mountpoint}" || continue
+            kill_mountpoint_processes    "${partition_mountpoint}"  || continue
+
+            disable_mountpoint_swapfiles "${partgrator_mountpoint}" || continue
+            disable_mountpoint_swapfiles "${partition_mountpoint}"  || continue
+
+               clone_mountpoint "${partition_mountpoint}" "${partgrator_mountpoint}" \
+            || continue
+
+               rename_partition "${partgrator_partition}" "${partition_label}" \
+            || continue
+
+               rename_partition "${partition}" "${partgrator_partition_label}" \
+            || { ret_code=$?
+                 rename_partition "${partgrator_partition}"       \
+                                  "${partgrator_partition_label}"
+
+                 [ ${ret_code} -eq ${revert_rename_failed} ] && break
+                 continue                                                    ; }
+
+               migrate_partgrator_file "${partition_mountpoint}"  \
+                                       "${partgrator_mountpoint}"                        \
+            || log_msg -p warning "Trying to perform the last steps in the"              \
+                                  "migration process anyway."                            \
+                                  "You may need to"                                      \
+                                  "create and/or delete" "${partgrator_file}"            \
+                                  "from"                 "${partition_label}"            \
+                                  "and/or"               "${partgrator_partition_label}" \
+                                  "manually"
+
+            log_msg "Migration performed successfully"
+
+            stop_services
+            # Needs to be called this way because the partitions were renamed
+            # while mounted
+            unmount_mountpoint    "${partition_mountpoint}"  "${partgrator_partition}"
+               unmount_mountpoint "${partgrator_mountpoint}" "${partition}"            \
+            && log_msg "Ready to resume with the new changes"
+
+            # Delete the current line from ${partition_status_lines} as it was
+            # processed successfully
+            partition_status_lines="$(  printf '%s' "${partition_status_lines}" \
+                                      | grep -v "^${partition_line}$"           )"
+
+            migration_started=1
+
+            # Updating the variable before processing the next partition
+            partgrator_partition="${partition}"
+        done
+        # This is done to prevent the partgrator partition from being deleted from the
+        # status file in the case it is mounted first and the partition is still not
+        # listed on the mtab
+        # The partition can only be removed from the status file if there is
+        # a partgrator partition on such file (due to the nested-loops design)
+           [ -n "${partition_processed_lines}" ]                                         \
+        && { processed_lines="${processed_lines}"$'\n'"${partgrator_line}"
+             processed_lines="${processed_lines}${partition_processed_lines}" ; } \
+    done
+
+    processed_lines="${processed_lines#${IFS}}"
+
+    if [ -n "${processed_lines}" ]; then
+        # Detect the partgrator partitions that are still mounted and unmount them
+        partgrator_lines="$(  echo "${processed_lines}"                \
+                            | awk '/ :'${partgrator_label}'/{print $1}')"
+                   regex=${partgrator_lines//\//\\\/}
+        partgrator_lines="$(awk '/^'${regex//${IFS}/ |^}' /{print $2}' "${mtab}")"
+        ( ignore_unmount_error=1  # partgrator partitions are safe to unmount with errors
+              try_lazy_unmount=1  # in unmount scripts (swapfile in use) and lazy unmount
+          for partgrator_mountpoint in ${partgrator_lines}; do
+              unmount_mountpoint "${partgrator_mountpoint}"
+          done                                                 )
+        # Remove the processed lines from the ${partition_status} file
+        regex=${processed_lines//\//\\\/}
+        regex="${regex//${IFS}/\$\\|^}"
+
+        partition_status_lines="$(sed '/^'${regex}'$/d' "${partitions_status}")"
+
+        printf '%s' "${partition_status_lines}${partition_status_lines:+${IFS}}" \
+               > "${partitions_status}"
+    fi
+
+    if [ -s "${partitions_status}" ]; then
+        unprocessed_partitions="$(sed -n 's/ [^:]*:/ (/;s/$/)/;1!H;1h;${g;s/\n/, /g;p}' \
+                                         "${partitions_status}"                         )"
+        log_msg -p warning "Some partitions are left unprocessed:" \
+                           "${unprocessed_partitions}"
+
+        experimental_reprocess_partitions "${unprocessed_partitions}" || return $?
+    elif [ -z "${eject_devices}" ]; then
+        log_msg "Nothing to migrate"
+    fi
+
+    log_msg "Finished partition migration"
+
+    return 0
+}
+
+experimental_reprocess_partitions() {
+    local                 partitions="${partitions}"
+
+    local                  partition=''
+
+    local       partgrator_partition=''
+    local partgrator_partition_label=''
+    local      partgrator_mountpoint=''
+
+    local                   ret_code=0
+
+    if    [ "${experimental_partition_reprocess}" != "0" ]        \
+       && ! expr "${partitions}" : '.*'"${partgrator_label}"      \
+       && partition="$(get_mountpoint_partition "${mountpoint}")"
+    then
+        log_msg -p warning "The following process is experimental"
+
+        log_msg "Attempting to locate a ${partgrator_label} partition and" \
+                "re-launch $0"
+
+        for partition in "${partition%%[0-9]}"*?; do
+            partgrator_partition_label="$(get_partition_label ${partition})"
+               ! case "${partgrator_partition_label}" in
+                      "${partgrator_label}"*) false;; esac                           \
+            && {  partgrator_partition="${partition}"
+                 partgrator_mountpoint="$(get_last_mountpoint "${partition}")"
+                 log_msg "${partgrator_partition_label} (${partgrator_partition})" \
+                         "successfully located"
+                 log_msg "Attempting to mount ${partgrator_partition} into" \
+                         "${partgrator_mountpoint} if the directory exist"
+                 break                                                      ;        }
+
+        done
+        if    [ -d "${partgrator_mountpoint}" ]                                    \
+           && mount_partition "${partgrator_partition}" "${partgrator_mountpoint}"
+        then
+            echo "${partition} 0 :${partgrator_partition_label}" \
+                 >> "${partitions_status}"                                    \
+            || { ret_code=$?
+                 log_msg -p error "echo failed with error code ${ret_code}" \
+                                  "when appending into ${partition_status}"
+                 false                                                      ; } \
+            && { rm -f -- "${migrating_file}"
+                 log_msg -p warning "Re-executing $0 with ${mountpoint}" \
+                                    "as parameter"
+                 trap - EXIT KILL QUIT INT
+                 $0 "${mountpoint}"
+                 exit 1                                                       ; }
+        fi
+        log_msg -p error "Unable to proceed"
+    fi
+
+    return 0
+}
+
+reload_devices() {
+    local       device=''
+    local   mountpoint=''
+    local  mountpoints=''
+    local unmount_fail=0
+
+    local mtab_content="$(cat "${mtab}")"
+
+    local          IFS=$' \n\t\r'
+    local     ret_code=0
+
+    for device in ${eject_devices}; do
+           expr $'\n'"${mtab_content}" : '.*'$'\n'"${device}[0-9]" > /dev/null \
+        && { log_msg -p warning "${device} still has mounted partitions"
+             stop_services
+             mountpoints="$(  echo "${mtab_content}"                      \
+                            | awk '/^'${device//\//\\\/}'[0-9]/{print $2}')"
+             unmount_fail=0
+             for mountpoint in ${mountpoints}; do
+                    unmount_mountpoint "${mountpoint}"      \
+                 || {     ret_code=$?
+                      unmount_fail=1
+                      [ "${force_eject}" = "0" ] && break ; }
+             done
+             if [ ${unmount_fail} -eq 1 ]; then
+                    [ "${force_eject}" = "0" ]                      \
+                 && { log_msg -p warning "Not ejecting ${device}"
+                      continue                                    ; }
+                 log_msg -p warning "\$force_eject is set,"          \
+                                    "dangerously ejecting ${device}"
+             fi                                                      ;         }
+
+           eject_device  "${device}"               \
+        && wait_device   "${device}"               \
+        && replug_device "${device}" "only_replug" \
+        || ret_code=$?
+    done
+
+    [ ${ret_code} -ne 0 ] && reload_disks
+
+    return ${ret_code}
+}
+
+graceful_exit() {
+    local ret_code=0
+
+    trap - EXIT KILL QUIT INT
+
+    if [ "${partgrator_post_mount}" = "0" ]; then
+        ! is_partgrator     # Its return code will determine whether the parent script
+                            # continues or preemptively exits if there is no other error
+        ret_code=$?
+    fi
+
+    if [ ${migration_started} -gt 0 ]; then
+        rm -f -- "${migrating_file}"
+
+        [ ! -s "${partitions_status}" ] && rm -f -- "${partitions_status}"
+
+        if [ -n "${eject_devices}" ]; then
+            ! reload_devices
+            ret_code=$?
+            [ ${migration_started} -ne 1 ] && start_services
+        fi
+
+        if [ ${migration_started} -eq 1 ]; then
+            [ -z "${eject_devices}" ] && log_msg "Data migration not necessary"
+        else
+            log_msg "Migration couldn't be completed, check previous lines for issues"
+        fi
+    elif [ -f "${migrating_file}" ]; then
+         log_msg "It seems there is a migration already in progress"
+         ret_code=2
+    fi
+
+    log_msg "Exiting"
+
+    exit ${ret_code}
+}
+
+interrupt_exit() {
+    local ret_code=3
+
+    trap - EXIT KILL QUIT INT
+
+    if [ ${migration_started} -gt 0 ]; then
+        rm -f -- "${migrating_file}"
+    fi
+    log_msg -p warning "Operation interrupted"
+
+    reload_devices || ret_code=$?
+
+       [ -n "${eject_devices}" ] || [ ${migration_started} -ne 1 ] \
+    && { start_services || ret_code=$?; }
+
+    log_msg "Exiting"
+
+    exit ${ret_code}
+}
+
+
+########### SOURCE INCLUDE ###########
+
+log_tag="partgrator-post"           # Tag used as prefix when logging messages
+
+. "${partgrator_dir}/helpers"
+
+
+############## CLEANUP ###############
+
+trap 'interrupt_exit' KILL QUIT INT
+trap  'graceful_exit' EXIT
+
+
+############### MAIN #################
+
+log_msg "Initializing partgrator-post script"
+
+check_tools "${tools_needed}" || exit $?
+
+log_msg "Starting with ${mountpoint} as parameter"
+
+   [ ! -f "${partitions_status}" ] \
+|| [   -f "${migrating_file}"    ] \
+&& exit 0
+
+   touch -- "${migrating_file}"                                    \
+|| { ret_code=$?
+     log_msg -p error "touch failed with error code ${ret_code}" \
+                      "when trying to create ${migrating_file}"
+     log_msg -p warning "Unable to start the migration process"
+     exit ${ret_code}                                            ; }
+
+migration_started=1
+
+recover_partitions || exit $?
+
+migrate_partitions || exit $?
+
+# End of main subshell - Comment redirection for debugging
+) > /dev/null 2> /dev/null \
+                           \
+|| exit $?                   # Exit the script (post-mount) preventing the following
+                             # sourced scripts from running
+
+
+####### UNSET USER VARIABLES ########
+
+unset -v partgrator_dir                   \
+         min_error_code                   \
+         max_error_code                   \
+         eject_code                       \
+         force_eject                      \
+         experimental_partition_reprocess \
+         tar_exclude
+
+
+# EOF

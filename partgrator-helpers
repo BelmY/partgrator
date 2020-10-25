@@ -1,0 +1,1123 @@
+#!/bin/sh
+
+# partgrator-helpers version 1.0.0
+#
+# partgrator-helpers provides function helpers for other partgrator scripts
+#
+# For more information, issues, or assistance visit: https://github.com/caribpa/partgrator
+#
+# Author: caribpa (https://github.com/caribpa)
+#
+# Copyright 2020 caribpa
+#
+# partgrator-helpers is free to use under the Artistic License 2.0
+#
+# Find the Artistic License 2.0 here: https://spdx.org/licenses/Artistic-2.0.html
+
+
+########### GLOBAL VARIABLES ##########
+
+   partgrator_dir="/jffs/addons/partgrator"    # Partgrator installation directory path
+
+ partgrator_label="_partgrator"                # Base label (name) of the partitions used
+                                               # for migration purposes. For example:
+                                               # _partgrator, _partgrator-test, and other
+                                               # suffixes are detected just by setting
+                                               # this variable to _partgrator
+                                               # Note that it cannot contain symbols with
+                                               # special shell/RE meaning:()[]+*?.\/^$|&"'
+
+  partgrator_file=".partgrator"                # Place this file in the root folder of a
+                                               # partition to allow partgrator to migrate
+                                               # the data in case the partition gets
+                                               # corrupted and unabled to be fixed by
+                                               # disk_check
+
+partitions_status="/tmp/.partitions_status"    # Statuses returned by disk-check's fsck
+   migrating_file="/tmp/.migrating_partition"  # Indicates that a migration is in progress
+
+       script_unmount="/jffs/scripts/unmount"        # AsuswrtMerlin unmount        script
+script_services_start="/jffs/scripts/services-start" # AsuswrtMerlin services_start script
+ script_services_stop="/jffs/scripts/services-stop"  # AsuswrtMerlin services_stop  script
+
+
+######## GLOBAL USER VARIABLES ########
+
+default_logfile="${partgrator_dir}/partgrator.log"  # Default logfile, disabled if empty
+
+default_log_tag="partgrator"           # Default tag used as prefix when logging messages
+default_logfile_date_format="+%T"      # Default date's format when logging to ${logfile}
+default_logfile_newline=1              # Default boolean for adding newlines after logging
+default_logfile_stamp=1                # Default boolean for adding a stamp to the logging
+default_logger_flags="-p notice"       # Default flags passed to the system logger tool
+default_mount_timeout=20               # Default time in seconds to wait for a mountpoint
+default_unmount_timeout=10             # Default time in seconds to wait when unmounting
+default_try_lazy_unmount=0             # Default boolean for attempting lazy unmounting
+default_start_services=''              # Default services (space separate) to try starting
+default_stop_services='nasapps'        # Default services (space separate) to try stopping
+default_ignore_start_service_error=1   # Default boolean for ignoring services-start error
+default_ignore_stop_service_error=1    # Default boolean for ignoring services-stop errors
+default_ignore_unmount_error=1         # Default boolean for ignoring unmount errors
+default_ignore_kill_process_error=1    # Default boolean for ignoring kill (process) error
+default_partgrator_pre_mount=0         # Default boolean for completely running pre-mount,
+default_partgrator_post_mount=0        # post-mount scripts with partgrator partitions
+default_partgrator_unmount=0           # and unmount
+
+# Override the defaults by setting the variable without 'default_' prefix prior sourcing
+# this file. Example: setting ${logfile} before sourcing this script will result in
+#                     using the user value instead of ${default_logfile} when sourcing
+
+
+####### GLOBAL SYSTEM VARIABLES #######
+
+[ -z "${logger}"           ] &&        logger="logger"       # System's log utility
+[ -z "${logger_output+y}"  ] && logger_output="> /dev/null"  # Suppress log_msg tee stdout
+
+[ -z "${mtab}"             ] &&             mtab="/etc/mtab" # File of mounted partitions
+[ -z "${proc_filesystems}" ] && proc_filesystems="/proc/filesystems" # Kernel Filesystems
+[ -z "${proc_swaps}"       ] &&       proc_swaps="/proc/swaps"       # Active Swap
+[ -z "${opt}"              ] &&              opt="/opt"              # Path of opt folder
+[ -z "${usb_drivers}"      ] &&      usb_drivers="/sys/bus/usb/drivers/usb"
+
+  usb_bind="${usb_drivers}/bind"     # Needed for performing a kernel's plugging   action
+usb_unbind="${usb_drivers}/unbind"   # Needed for performing a kernel's unplugging action
+
+
+######################################
+###                               ####
+###  USERS DO NOT NEED TO MODIFY  ####
+###       BELOW THIS POINT        ####
+###                               ####
+######################################
+
+
+      not_found_code=123
+
+helpers_tools_needed='[
+                      awk
+                      blkid
+                      cut
+                      date
+                      echo
+                      ejusb
+                      expr
+                      false
+                      grep
+                      kill
+                      mke2fs
+                      nvram
+                      ps
+                      sed
+                      service
+                      sleep
+                      socat
+                      sync
+                      tee
+                      tune2fs
+                      type
+                      udevtrigger
+                      umount
+                      xargs      '
+
+
+##### OPERATIONS WITH VARIABLES ######
+
+[ -n "${log_tag+y}" ] || log_tag="${default_log_tag}"
+
+[ -n "${logfile+y}" ] || {    [ -d "${default_logfile%/*}" ] \
+                           && logfile="${default_logfile}"   ; }
+
+[ -n "${logfile_newline+y}"     ] ||     logfile_newline="${default_logfile_newline}"
+[ -n "${logfile_stamp+y}"       ] ||       logfile_stamp="${default_logfile_stamp}"
+[ -n "${logfile_date_format+y}" ] || logfile_date_format="${default_logfile_date_format}"
+[ -n "${logger_flags+y}"        ] ||        logger_flags="${default_logger_flags}"
+[ -n "${mount_timeout+y}"       ] ||       mount_timeout="${default_mount_timeout}"
+[ -n "${unmount_timeout+y}"     ] ||     unmount_timeout="${default_unmount_timeout}"
+[ -n "${try_lazy_unmount+y}"    ] ||    try_lazy_unmount="${default_try_lazy_unmount}"
+[ -n "${start_services+y}"      ] ||      start_services="${default_start_services}"
+[ -n "${stop_services+y}"       ] ||       stop_services="${default_stop_services}"
+
+   [ -n "${ignore_start_service_error+y}" ]                           \
+|| ignore_start_service_error="${default_ignore_start_service_error}"
+
+   [ -n "${ignore_stop_service_error+y}" ]                          \
+|| ignore_stop_service_error="${default_ignore_stop_service_error}"
+
+   [ -n "${ignore_unmount_error+y}" ]                     \
+|| ignore_unmount_error="${default_ignore_unmount_error}"
+
+   [ -n "${ignore_kill_process_error+y}" ]                          \
+|| ignore_kill_process_error="${default_ignore_kill_process_error}"
+
+   [ -n "${partgrator_pre_mount}" ]                       \
+|| partgrator_pre_mount="${default_partgrator_pre_mount}"
+
+   [ -n "${partgrator_post_mount}" ]                        \
+|| partgrator_post_mount="${default_partgrator_post_mount}"
+
+   [ -n "${partgrator_unmount}" ]                     \
+|| partgrator_unmount="${default_partgrator_unmount}"
+
+
+############## HELPERS ###############
+
+log_msg() {
+    local logger_params=""
+    local      priority=""               # Just used for logging priorities on ${logfile}
+    local    no_newline=""
+    local         stamp=""
+
+    local           IFS=$' \n\t\r'
+
+    exec 3>&1 4>&2 1>/dev/null           # Save stdout and stderr and redirect stdout
+
+    set -- ${logger_flags} "$@"
+    while case "$1" in
+              '-s') exec 1>&4; shift ;;  # Redirect stdout to stderr's copy
+              '-c') exec 1>&3; shift ;;  # Restore stdout
+              '-p') shift
+                    logger_params="${logger_params}-p $1 "
+                         priority=" [$1]"
+                    shift
+                    ;;
+                 *) false
+          esac
+    do :; done
+
+    [ -z "$*" ] && local logfile='/dev/null' # Don't save output when the input is empty
+
+    [ "${logfile_newline:-0}" = "0" ] && no_newline="-n"
+       [ "${logfile_stamp-1}" = "1" ]                                                \
+    && stamp="$(date ${logfile_date_format})${log_tag:+ }${log_tag#*-}:${priority} "
+
+    eval 'echo ${no_newline} "${stamp}$@" | tee -a "${logfile}"' "${logger_output}"
+
+    exec 1>&3 2>&4 3>&- 4>&-          # Restore stdout and stderr, and close copies
+
+    # TODO - This logger needs to be more generic so that the -t flag could be
+    #      system's logger independent (even using echo)
+    ${logger} ${logger_params} -t "${log_tag}" "$@"
+    return $?
+}
+
+check_tools() {
+    local tools_needed="$1"
+    local         tool=''
+
+    local       LC_ALL=C
+    local         PATH=/sbin:/bin:/usr/sbin:/usr/bin
+    local          IFS=$' \n\t\r'
+
+    log_msg "Checking if the necessary tools can be found"
+
+    for tool in ${tools_needed}; do
+        if ! type "${tool}" >/dev/null 2>/dev/null; then
+            log_msg -p error "System does not include tool '${tool}'" \
+                             "required by partgrator"
+            return 1
+        fi
+    done
+
+    log_msg "All necessary tools found"
+    return 0
+}
+
+check_helpers_tools() {
+    local LC_ALL=C
+    local   PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+    if [ "${helpers_tools_check-yes}" = "yes" ]; then
+        log_msg "Importing helpers"
+
+        check_tools "${helpers_tools_needed}" || return $?
+
+        log_msg "Helpers successfully imported"
+    fi
+
+    return 0
+}
+
+jffs_scripts_enabled() {
+    [ "$(nvram get jffs2_scripts)" = "1" ]
+    return $?
+}
+
+reload_disks() {
+    log_msg "Reloading disks"
+
+    udevtrigger --subsystem-match=block  # Use --verbose to see some output
+
+    # hotplug2  # This is an alternative that seems to reload disks but hangs frequently
+
+    return $?
+}
+
+get_partition_label() {
+    local partition="$1"
+
+    local blkid_out=''
+    local     label=''
+
+    local  ret_code=0
+
+       blkid_out="$(blkid "${partition}" 2> /dev/null)"                \
+    || { ret_code=$?
+         log_msg -p error "blkid failed with error code ${ret_code}" \
+                          "when retrieving ${partition} details"
+         return ${ret_code}                                          ; }
+
+    if [ -z "${blkid_out}" ]; then
+        log_msg -p warning "${partition} is still not ready"
+        return 2
+    fi
+
+    if expr "${blkid_out}" : "${partition}: LABEL=" > /dev/null; then
+        # Partition has a label
+        # Trim everything around the first and last double-quotes of the label
+        label="${blkid_out#*=\"}"
+        label="${label%\" *}"
+    else
+        # Partition has no label so assign as label the partition device
+        # (device name + partition number)
+        label=${partition##*\/}
+    fi
+
+    echo "${label}"
+
+    return 0
+}
+
+get_partition_filesystem() (
+    local  partition="$1"
+
+    local filesystem=''
+
+    local   ret_code=0
+
+    set -o pipefail
+
+    # Trick for running mke2fs interactively so that the filesystem is output
+    # independently of the partition being mounted
+       filesystem="$(  { socat EXEC:'mke2fs -q -t ext2 -n '${partition},pty \
+                               STDIO                            2>/dev/null & } \
+                     | awk   '/'${partition//\//\\\/}'/{ print $4; exit }'      )" \
+    || { ret_code=$?
+         log_msg -p error "mke2fs (executed by socat) failed"       \
+                          "with error code ${ret_code}"             \
+                          "when retrieving ${partition} filesystem"
+         return ${ret_code}                                         ; }
+
+       [ -z "${filesystem}" ]                                              \
+    && { log_msg -p error "${partition} filesystem couldn't be detected"
+         return 1                                                        ; }
+
+    echo "${filesystem}"
+
+    return 0
+)
+
+get_partition_details() {
+    local              partition="$1"
+
+    local      partition_details=''
+    local                  label=''
+    local    filesystem_features=''
+    local        max_mount_count=''
+    local         check_interval=''
+    local        errors_behavior=''
+    local          mount_options=''
+    local extended_mount_options=''
+
+    local      partition_details=''
+
+    local               ret_code=0
+
+       partition_details="$(tune2fs -l "${partition}")"                   \
+    || { ret_code=$?
+         log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                          "when retrieving ${partition} details"
+         return "${ret_code}"                                          ; }
+
+                     label="$(expr "${partition_details}" :                     \
+                                   '.*Filesystem volume name: *\([^'$'\n'']*\)' )"
+       filesystem_features="$(expr "${partition_details}" :                  \
+                                   '.*Filesystem features: *\([^'$'\n'']*\)' )"
+           max_mount_count="$(expr "${partition_details}" :                  \
+                                   '.*Maximum mount count: *\([^'$'\n'']*\)' )"
+            check_interval="$(expr "${partition_details}" :               \
+                                   '.*Check interval: *\([^'$'\n'' (]*\)' )"
+            errors_behavior="$(expr "${partition_details}" :             \
+                                   '.*Errors behavior: *\([^'$'\n'']*\)' )"
+             mount_options="$(expr "${partition_details}" :                    \
+                                   '.*Default mount options: *\([^'$'\n'']*\)' )"
+    extended_mount_options="$(expr "${partition_details}" :            \
+                                   '.*Mount options: *\([^'$'\n'']*\)' )"
+
+         # Convert the interval from seconds to days
+            check_interval="$(expr ${check_interval} / 60 / 60 / 24)"
+
+         # Parse tune2fs errors behavior string
+            errors_behavior="$(  echo "${errors_behavior}"                   \
+                               | sed 'y/PC/pc/; s/.*read-only.*/remount-ro/' )"
+
+         partition_details="${label} | ${filesystem_features} | ${max_mount_count}"
+         partition_details="${partition_details} | ${check_interval} | ${errors_behavior}"
+         partition_details="${partition_details} | ${mount_options}"
+         partition_details="${partition_details} | ${extended_mount_options}"
+
+    echo "${partition_details}"
+
+    return 0
+}
+
+get_partition_mountpoint() {
+    local  partition="$1"
+
+    local mountpoint=''
+
+    local   ret_code=0
+
+       mountpoint="$(awk 'BEGIN{e='${not_found_code}'}                       \
+                          /^'${partition//\//\\\/}' /{print $2; e=0; exit e} \
+                          END{exit e}                                        ' \
+                         "${mtab}"                                             )"  \
+    || { ret_code=$?
+            [ ${ret_code} -ne ${not_found_code} ]                                        \
+         && log_msg -p error "awk failed with error code ${ret_code} when" \
+                             "trying to retrieve ${partition} mountpoint"  \
+                             "from ${mtab}"
+         return ${ret_code}                                                ;       }
+
+    echo "${mountpoint}"
+
+    [ -e "${mountpoint}" ] || ret_code="${not_found_code}"
+
+    return ${ret_code}
+}
+
+get_mountpoint_partition() {
+    local mountpoint="$1"
+
+    local  partition=''
+
+    local   ret_code=0
+
+    # Escaping all the ${mountpoint} (mp) punctuation with gsub before matching
+       partition="$(awk 'BEGIN{ e='${not_found_code}';       \
+                               mp=" '${mountpoint}' ";       \
+                               gsub(/[[:punct:]]/,"\\\\&",mp)} \
+                         ($0 ~ mp){print $1; e=0; exit e}      \
+                         END{exit e}                           ' \
+                        "${mtab}"                                )"          \
+    || { ret_code=$?
+            [ ${ret_code} -ne ${not_found_code} ]                            \
+         && log_msg -p error "awk failed with error code ${ret_code} when" \
+                             "trying to retrieve ${mountpoint} partition"  \
+                             "from ${mtab}"
+         return ${ret_code}                                                ; }
+
+    echo "${partition}"
+
+    [ -e "${partition}" ] || ret_code=${not_found_code}
+
+    return ${ret_code}
+}
+
+# Format partition assuming it has an ext filesystem
+#
+# The issue is that we can only rename ext2 or ext3 filesystems AFTER
+# performing the backup for all the other formats there's not tune2fs
+# equivalent for changing the label afterwards
+# The only alternative is to perform the renaming when formatting the
+# partition but it is less efficient (as we have to format twice) and we risk
+# ending up with duplicate labels if the backup process is interrupted
+# midway
+# We'd have to rethink the whole backup process for handling this error case
+# I guess we'd have to track the process through the ${partgrator_file}
+# Honestly, doing it the two format way would make life easier for recovering
+# in case something went wrong and continue with an unfinished migration
+
+# Labels for other formatting tools
+#   mkfatfs uses -l for the label
+#   mkdosfs uses -n for the label (mkfs.vfat seems to be the same)
+#   mkntfs  uses -L for the label, using -f for fast would also be interesting
+format_partition() (
+    local              partition="$1"
+    local     partition_template="$2"
+    local                  label="$3"
+
+    local      partition_details=''
+    local             filesystem=''
+    local    filesystem_features=''
+    local        max_mount_count=''
+    local         check_interval=''
+    local        errors_behavior=''
+    local      old_mount_options=''
+    local      new_mount_options=''
+    local extended_mount_options=''
+
+    local             bad_option=''
+    local               ret_code=0
+
+    set -o pipefail
+
+    log_msg "Formatting ${partition}"
+
+       [ -z "${partition_template}" ]    \
+    && partition_template="${partition}"
+
+    filesystem="$(get_partition_filesystem "${partition_template}")" || return $?
+
+    # Detect whether the filesystem is ext2, ext3, or ext4 and fail if not
+    if    case "${filesystem}" in ext[234]) false;; esac  \
+       && ! grep -q "${filesystem}" "${proc_filesystems}"
+    then
+        log_msg -p error "Filesystem ${filesystem} not supported"
+        return 1
+    fi
+
+         partition_details="$(  get_partition_details "${partition_template}" \
+                              | sed 's/ | /|/g'                               )" \
+    || return $?
+
+       [ -z "${label}" ]                                                     \
+    &&               label="$(echo "${partition_details}" | cut -d'|' -f 1)"
+       filesystem_features="$(echo "${partition_details}" | cut -d'|' -f 2)"
+           max_mount_count="$(echo "${partition_details}" | cut -d'|' -f 3)"
+            check_interval="$(echo "${partition_details}" | cut -d'|' -f 4)"
+           errors_behavior="$(echo "${partition_details}" | cut -d'|' -f 5)"
+         new_mount_options="$(echo "${partition_details}" | cut -d'|' -f 6)"
+    extended_mount_options="$(echo "${partition_details}" | cut -d'|' -f 7)"
+
+       [ -n "${label}" ]         \
+    && label="-L${label// /\\ }"
+
+       [ -n "${filesystem_features}" ]                     \
+    && filesystem_features="-O${filesystem_features// /,}"
+
+    # TODO - Check if there is a different way of running it non-interactively
+       : | mke2fs -t "${filesystem}" ${label} ${filesystem_features} "${partition}" \
+    || { ret_code=$?
+         log_msg -p error "mke2fs failed with error code ${ret_code} when" \
+                          "formatting ${partition}"
+         return ${ret_code}                                                ;        }
+
+       tune2fs -c "${max_mount_count}" -- "${partition}" > /dev/null     \
+    || { ret_code=$?
+         log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                          "when setting ${partition} max mount count"
+         return ${ret_code}                                            ; }
+
+       tune2fs -i "${check_interval}" -- "${partition}" > /dev/null      \
+    || { ret_code=$?
+         log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                          "when setting ${partition} check interval"
+         return ${ret_code}                                            ; }
+
+       tune2fs -e "${errors_behavior}" -- "${partition}" > /dev/null     \
+    || { ret_code=$?
+         log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                          "when setting ${partition} errors behavior"
+         return ${ret_code}                                            ; }
+
+    if [ -n "${new_mount_options}" ]; then
+        old_mount_options="$(  tune2fs -l "${partition}"                     \
+                             | sed -n '/^Default mount options: */{s///p;q}' )"
+
+        if [ -n "${old_mount_options}" ]; then
+               tune2fs -o "^${old_mount_options// /,^}" -- "${partition}" > /dev/null \
+            || { ret_code=$?
+                 log_msg -p error "tune2fs failed with error code ${ret_code}"    \
+                                  "when unsetting ${partition} old mount options" ;   }
+        fi
+
+           tune2fs -o "${new_mount_options// /,}" -- "${partition}" > /dev/null \
+        || { ret_code=$?
+             log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                              "when setting ${partition} mount options"
+             return ${ret_code}                                            ;    }
+    fi
+
+    if [ -n "${extended_mount_options}" ]; then
+        bad_option="$(  tune2fs -E mount_opts="${extended_mount_options// /,}"      \
+                                -- "${partition}"                              2>&1 \
+                      | sed -n '/Bad options specified/{p;q}'                       )"
+        ret_code=$?
+
+           [ -n "${bad_option}" ]                                                      \
+        && { log_msg -p warning "More than one extended mount option detected in"  \
+                                "${partition} and tune2fs is unable to parse them"
+             log_msg -p warning "Writing them in ${partition} superblock separated" \
+                                "by spaces instead of comas"
+             log_msg -p warning "Note that EXT4-fs will complain about unrecognized" \
+                                "options when mounting the partition"
+             log_msg -p warning "Please review them to remove this and EXT4-fs" \
+                                "warnings"
+             tune2fs -E mount_opts="${extended_mount_options}" -- "${partition}" \
+                                                                      >/dev/null
+             ret_code=$?                                                         ;     }
+
+           [ ${ret_code} -ne 0 ]                                             \
+        && { log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                              "when changing ${partition} mount options"
+             return ${ret_code}                                            ; }
+    fi
+
+    if [ ${ret_code} -eq 0 ]; then
+        log_msg "${partition} was formatted successfully"
+    else
+        log_msg -p warning "There was an error when formatting ${partition}"
+    fi
+
+    return ${ret_code}
+)
+
+start_services() {
+    local services="${start_services}"
+    local  service=''
+
+    local ret_code=0
+
+    if jffs_scripts_enabled && [ -x "${script_services_start}" ]; then
+        log_msg "Executing ${script_services_start}"
+
+           "${script_services_start}" > /dev/null 2> /dev/null                    \
+        || { ret_code=$?
+             log_msg -p error "${script_services_start} failed with error code" \
+                              "${ret_code}"
+             [ "${ignore_start_service_error}" = "0" ] && return ${ret_code}
+             log_msg -p warning "Ignoring previous error"                       ; }
+    fi
+
+    for service in ${services}; do
+        log_msg "Starting service ${service}"
+           service "start_${service}" > /dev/null 2> /dev/null                       \
+        || { ret_code=$?
+             log_msg -p error "service command failed with error code ${ret_code}" \
+                              "when starting ${service}"
+             [ "${ignore_start_service_error}" = "0" ] && return ${ret_code}
+             log_msg -p warning "Ignoring previous error"                          ; }
+    done
+
+    return ${ret_code}
+}
+
+stop_services() {
+    local services="${stop_services}"
+    local  service=''
+
+    local ret_code=0
+
+    if jffs_scripts_enabled && [ -x "${script_services_stop}" ]; then
+        log_msg "Executing ${script_services_stop}"
+
+           "${script_services_stop}" > /dev/null 2> /dev/null                \
+        || { ret_code=$?
+             log_msg -p error "${script_services_stop} failed with error" \
+                              "code ${ret_code}"
+             [ "${ignore_stop_service_error}" = "0" ] && return ${ret_code}
+             log_msg -p warning "Ignoring previous error"                  ; }
+    fi
+
+    for service in ${services}; do
+        log_msg "Stopping service ${service}"
+           service "stop_${service}" > /dev/null 2> /dev/null                          \
+        || { ret_code=$?
+             log_msg -p error "service command failed with error code ${ret_code}"   \
+                              "when stopping ${service}"
+             [ "${ignore_stop_service_error}" = "0" ] && return ${ret_code}
+             log_msg -p warning "Continuing without successfully stopping ${service}"
+             false                                                                   ; } \
+        && log_msg "${service} successfully stopped"
+    done
+
+    [ "${ignore_stop_service_error}" != "0" ] && ret_code=0
+
+    return ${ret_code}
+}
+
+wait_device() {
+    local       device="$1"
+    local wait_timeout=$((mount_timeout + 1))
+
+    log_msg "Waiting up to ${mount_timeout} seconds for ${device}"
+
+    while [ $((--wait_timeout)) -gt 0 ]; do
+        sleep 1
+        [ -e "${device}" ] && break
+    done
+
+    if [ ${wait_timeout} -eq 0 ]; then
+        log_msg -p error "${device} not ready after waiting" \
+                         "${mount_timeout} seconds"
+        log_msg -p warning "Consider incrementing the value"               \
+                           "of \$mount_timeout (${mount_timeout} seconds)" \
+                           "if you think you need to wait more"
+        return 1
+    else
+        log_msg "${device} is ready after waiting"            \
+                "$((mount_timeout - wait_timeout)) second(s)"
+    fi
+    return 0
+}
+
+wait_mountpoint() {
+    local   mountpoint="$1"
+    local wait_timeout=$((mount_timeout + 1))
+
+    log_msg "Waiting up to ${mount_timeout} seconds for ${mountpoint}"
+
+    while [ $((--wait_timeout)) -gt 0 ]; do
+        sleep 1
+        # Less reliable but more efficient would be using [ -f ] on the mountpoint
+        # honestly I think we could switch to the -f method if we clean the mountpoint
+        # folder after a graceful unmount. But we cannot always assume that the
+        # unmount would be graceful and performed by this script, so it is better to
+        # use separate scripts, and rely on the pre-mount one to properly clean the
+        # previously existing mount folders
+        grep -q "\s${mountpoint}\>\|^${mountpoint}\>" "${mtab}" && break
+    done
+
+    if [ ${wait_timeout} -eq 0 ]; then
+        log_msg -p error "${mountpoint} not ready after"    \
+                         "waiting ${mount_timeout} seconds"
+        log_msg -p warning "Consider incrementing the value"               \
+                           "of \$mount_timeout (${mount_timeout} seconds)" \
+                           "if you think you need to wait more"
+        return 1
+    else
+        log_msg "${mountpoint} is ready after waiting"        \
+                "$((mount_timeout - wait_timeout)) second(s)"
+    fi
+    return 0
+}
+
+wait_partition_mountpoint() {
+    local partition="$1"
+
+       wait_mountpoint          "${partition}" \
+    && get_partition_mountpoint "${partition}"
+
+    return $?
+}
+
+unmount_partition() {
+    local    partition="$1"
+    local         kill="$2"
+
+    local   mountpoint=""
+    local wait_timeout=$((unmount_timeout + 1))
+
+    local     ret_code=0
+
+    log_msg "Unmounting ${partition}"
+
+    sync
+    umount -- "${partition}" 2>/dev/null
+    ret_code=$?
+
+    if [ ${ret_code} -ne 0 ]; then
+        while [ $((--wait_timeout)) -gt 0 ]; do
+            sleep 1
+
+            umount -- "${partition}" 2>/dev/null
+            ret_code=$?
+            [ ${ret_code} -eq 0 ] && break
+        done
+        if [ ${wait_timeout} -eq 0 ]; then
+            log_msg -p warning "Unable to unmount cleanly, trying force-unmounting"
+
+            wait_timeout=$((unmount_timeout + 1))
+            while [ $((--wait_timeout)) -gt 0 ]; do
+                sleep 1
+                umount -f -- "${partition}" 2>/dev/null
+                ret_code=$?
+                [ ${ret_code} -eq 0 ] && break
+            done
+
+            if [ ${ret_code} -ne 0 ]; then
+                   mountpoint="$(get_partition_mountpoint "${partition}")" \
+                && [ -z "${kill}" ]                                        \
+                && { log_msg -p warning "Trying again after killing all" \
+                                        "${mountpoint} processes"        \
+                                        "using ${opt}/"
+                     kill_mountpoint_processes "${mountpoint}"
+                     unmount_partition "${partition}" 1   # Design this without recursion
+                     return $?                                           ; }
+
+                if [ "${try_lazy_unmount}" != "0" ]; then
+                    log_msg -p warning "Unable to force-unmount, trying lazy-unmounting"
+                    log_msg -p warning "Note that there may be side effects if remounting"
+                    umount -l -- "${partition}"
+                    ret_code=$?
+                fi
+            fi
+        fi
+    fi
+    if [ ${ret_code} -ne 0 ]; then
+        log_msg -p error "umount failed with error code ${ret_code} when"  \
+                         "trying to unmount ${partition}."                 \
+                         "Changes won't be applied until next disk reload"
+    else
+        log_msg "Unmounted ${partition} successfully"
+    fi
+    return ${ret_code}
+}
+
+# Would be nice to have a systool implementing `umount_mountpoint` as described in:
+# https://github.com/RMerl/asuswrt-merlin.ng/blob/master/release/src/router/rc/usb.c
+unmount_mountpoint() {
+    local mountpoint="$1"
+    local  partition="$2"
+
+    local   ret_code=0
+
+    if [ -z "${partition}" ]; then
+        partition="$(get_mountpoint_partition "${mountpoint}")"
+    fi
+    if ! grep -q "^${partition} " "${mtab}"; then
+        log_msg -p warning "${mountpoint} is not mounted"
+        return 0
+    fi
+
+    if    case "${mountpoint##*/}" in "${partgrator_label//[ \"\']/_}"*) false;; esac \
+       || [ "${partgrator_unmount}" != "0" ]                                          \
+       && jffs_scripts_enabled                                                        \
+       && [ -x "${script_unmount}" ]
+    then
+        log_msg "Executing ${script_unmount} ${mountpoint}"
+
+           "${script_unmount}" "${mountpoint}" > /dev/null 2> /dev/null     \
+        || { ret_code=$?
+             log_msg -p error "${script_unmount} failed with error code"  \
+                              "${ret_code} when unmounting ${mountpoint}"
+             [ "${ignore_unmount_error}" = "0" ] && return ${ret_code}
+             log_msg -p warning "Ignoring previous error"                 ; }
+    fi
+
+    unmount_partition "${partition}"
+    ret_code=$?
+
+    return ${ret_code}
+}
+
+kill_mountpoint_processes() (
+    local mountpoint="$1"
+
+    local   ret_code=0
+
+    set -o pipefail
+
+    if    case "${mountpoint##*/}" in "${partgrator_label//[ \"\']/_}"*) false;; esac \
+       || [ "${partgrator_unmount}" != "0" ]                                          \
+       && jffs_scripts_enabled                                                        \
+       && [ -x "${script_unmount}" ]
+    then
+        log_msg "Executing ${script_unmount} ${mountpoint}"
+
+           "${script_unmount}" "${mountpoint}" > /dev/null 2> /dev/null     \
+        || { ret_code=$?
+             log_msg -p error "${script_unmount} failed with error code"  \
+                              "${ret_code} when unmounting ${mountpoint}"
+             [ "${ignore_unmount_error}" = "0" ] && return ${ret_code}
+             log_msg -p warning "Ignoring previous error"                 ; }
+    fi
+
+    if readlink -f "${opt}" | grep -q "^${mountpoint%/}/"; then
+        log_msg "Killing ${opt} processes"
+
+           ps w | awk '/'${opt//\//\\\/}'\//{print $1}' | xargs -I '{}' kill "{}"  \
+        || { ret_code=$?
+             log_msg -p error "There was an error when trying to kill"           \
+                              "${mountpoint} processes. Return code ${ret_code}"
+             [ "${ignore_kill_process_error}" = "0" ] && return ${ret_code}
+             log_msg -p warning "Continuing without killing all processes"; false; } \
+        && log_msg "${opt} processes successfully killed"
+    fi
+
+    [ "${ignore_kill_process_error}" != "0" ] && ret_code=0
+
+    return ${ret_code}
+)
+
+# ------------------------------------------------------------
+# Inputs
+#   - device
+# ------------------------------------------------------------
+eject_device() (
+    local   device="$1"
+
+    local usb_path=''
+    local usb_node=''
+
+    local ret_code=0
+
+    set -o pipefail
+
+    log_msg "Ejecting ${device}"
+
+    # TODO - Not a fan of poking on nvram values, can we get the node value from /sys?
+       usb_path="$(nvram get "usb_path_${device##*/}")"                 \
+    || { ret_code=$?
+         log_msg -p error "nvram failed with error code ${ret_code}"  \
+                          "when getting usb_path_${device##*/} value"
+         return ${ret_code}                                           ; }
+
+       [ -z "${usb_path}" ]                                \
+    && { log_msg -p error "${device} usb_path not found"
+         return 18                                       ; }
+
+       usb_node="$(  nvram dump 2> /dev/null                                      \
+                   | sed -n '/usb_path\([0-9]\+\)_node='${usb_path}'/{s//\1/p;q}' )" \
+    || { ret_code=$?
+         # Ignoring the error code returned due to broken pipe
+            [ ${ret_code} -ne 141 ]                                         \
+         && { log_msg -p error "nvram failed with error code ${ret_code}" \
+                               "when dumping variables"
+              return ${ret_code}                                          ; }      ; }
+
+       [ -z "${usb_node}" ]                                \
+    && { log_msg -p error "${device} usb_node not found"
+         return 19                                       ; }
+
+       ejusb "${usb_node}" 0 -u 0 > /dev/null 2> /dev/null                            \
+    || { ret_code=$?
+         log_msg -p error "ejusb failed with error code ${ret_code}"                \
+                          "when safely unmounting usb port ${usb_node} (${device})"
+         return ${ret_code}                                                         ; }
+
+    log_msg "${device} was ejected successfully!"
+
+    return 0
+)
+
+# --------------------------------------------------------------
+# Inputs
+#     - device
+#     - only_replug (optional)
+# Outputs
+#     - device
+# --------------------------------------------------------------
+# We are assuming we are dealing with USBs and fixed /sys paths
+# The commands could be generalized by finding the appropriate path
+# of the driver folder providing we know the device path:
+#   find /sys/bus/*/drivers -name 3-1
+# --------------------------------------------------------------
+replug_device() {
+    local       device="$1"
+    local  only_replug="$2"
+
+    local   old_device="${device}"
+    local     usb_path=''
+    local     usb_node=''
+    local usb_sys_path="${usb_drivers}"
+    local wait_timeout=$((mount_timeout + 1))
+
+    local     ret_code=0
+
+    log_msg "Replugging ${device} by unbinding and rebinding it back"
+
+       usb_path="$(nvram get "usb_path_${device##*/}")"                \
+    || { ret_code=$?
+         log_msg -p error "nvram failed with error code ${ret_code}" \
+                          "when getting usb_path_${device##*/} value"
+         return ${ret_code}                                          ; }
+
+       usb_node="$(  nvram dump 2> /dev/null                                      \
+                   | sed -n '/usb_path\([0-9]\+\)_node='${usb_path}'/{s//\1/p;q}' )" \
+    || { ret_code=$?
+         # Ignoring the error code returned due to broken pipe
+            [ ${ret_code} -ne 141 ]                                         \
+         && { log_msg -p error "nvram failed with error code ${ret_code}" \
+                               "when dumping variables"
+              return ${ret_code}                                          ; }      ; }
+
+    log_msg "Unbinding ${device}"
+
+       echo "${usb_path}" > "${usb_unbind}" 2> /dev/null               \
+    || { ret_code=$?
+         log_msg -p error "echo failed with error code ${ret_code}"  \
+                          "when unbinding ${device}"                 \
+                          "(writing ${usb_path} into ${usb_unbind})"
+         return ${ret_code}                                          ; }
+
+    usb_sys_path="${usb_sys_path}/${usb_path}"
+
+    # If we bind immediately then the kernel may still use the same
+    # device we just tried to unbind
+    while [ $((--wait_timeout)) -gt 0 ]; do
+        sleep 1
+        [ ! -e "${usb_sys_path}" ] && break
+    done
+       [ ${wait_timeout} -eq 0 ]                                              \
+    && { log_msg -p error   "${device} was not unbind after" \
+                            "${mount_timeout} seconds"
+         log_msg -p warning "Consider incrementing the value"               \
+                            "of \$mount_timeout (${mount_timeout} seconds)" \
+                            "if you think you need to wait more"
+         return 1                                                           ; }
+
+    log_msg "${device} was unbind after"                  \
+            "$((mount_timeout - wait_timeout)) second(s)"
+
+    log_msg "Binding ${device}"
+       echo "${usb_path}" > "${usb_bind}" 2> /dev/null                 \
+    || { ret_code=$?
+         log_msg -p error "echo failed with error code ${ret_code}"  \
+                          "when binding ${device}"                   \
+                          "(writing ${usb_path} into ${usb_bind})"
+         return ${ret_code}                                          ; }
+
+    wait_timeout=$((mount_timeout + 1))
+    while [ $((--wait_timeout)) -gt 0 ]; do
+        sleep 1
+        [ -e "${usb_sys_path}" ] && break
+    done
+       [ ${wait_timeout} -eq 0 ]                                              \
+    && { log_msg -p error   "${device} was not bind after"     \
+                            "waiting ${mount_timeout} seconds"
+         log_msg -p warning "Consider incrementing the value"               \
+                            "of \$mount_timeout (${mount_timeout} seconds)" \
+                            "if you think you need to wait more"
+         return 1                                                           ; }
+
+    log_msg "${device} was bind after"                    \
+            "$((mount_timeout - wait_timeout)) second(s)"
+
+    log_msg "${device} was successfully replugged!"
+
+    [ -n "${only_replug}" ] && return 0
+
+    log_msg "Retrieving updated device name and path"
+
+    wait_timeout=$((mount_timeout + 1))
+    while [ $((--wait_timeout)) -gt 0 ]; do
+           device="$(nvram get "usb_path${usb_node}_act")"                    \
+        || { ret_code=$?
+             log_msg -p error "nvram failed with error code ${ret_code}"    \
+                              "when getting usb_path_${usb_node}_act value"
+             return ${ret_code}                                             ; }
+
+        [ -n "${device}" ] && break
+        sleep 1
+    done
+       [ ${wait_timeout} -eq 0 ]                                              \
+    && { log_msg -p error   "Device name couldn't be retrieved after" \
+                            "waiting ${mount_timeout} seconds"
+         log_msg -p warning "Consider incrementing the value"               \
+                            "of \$mount_timeout (${mount_timeout} seconds)" \
+                            "if you think you need to wait more"
+         return 15                                                          ; }
+
+    log_msg "Device name retrieved after $((mount_timeout - wait_timeout)) second(s)"
+
+    device="/dev/${device}"
+
+       [ ! -e "${device}" ]                                               \
+    && { log_msg -p error "New device path ${device} couldn't be found"
+         return 16                                                      ; }
+
+    if [ "${device}" != "${old_device}" ]; then
+        log_msg "Device path updated successfully from ${old_device} to ${device}"
+    else
+        log_msg "New device path is the same as before (${device})"
+    fi
+
+    echo "${device}"
+
+    return 0
+}
+
+unset_helpers() {
+    unset -f log_msg                            \
+             check_tools                        \
+             check_helpers_tools                \
+             jffs_scripts_enabled               \
+             reload_disks                       \
+             get_partition_label                \
+             get_partition_filesystem           \
+             get_partition_details              \
+             get_partition_mountpoint           \
+             get_mountpoint_partition           \
+             format_partition                   \
+             start_services                     \
+             stop_services                      \
+             wait_device                        \
+             wait_mountpoint                    \
+             wait_partition_mountpoint          \
+             unmount_partition                  \
+             unmount_mountpoint                 \
+             kill_mountpoint_processes          \
+             eject_device                       \
+             replug_device                      \
+             unset_helpers
+
+    unset -v not_found_code                     \
+             helpers_tools_needed
+
+    unset -v logger                             \
+             logger_output                      \
+             mtab                               \
+             proc_filesystems                   \
+             proc_swaps                         \
+             opt                                \
+             usb_drivers                        \
+             usb_bind                           \
+             usb_unbind
+
+    unset -v default_log_tag                    \
+             default_logfile                    \
+             default_logfile_date_format        \
+             default_logfile_newline            \
+             default_logfile_stamp              \
+             default_logger_flags               \
+             default_mount_timeout              \
+             default_unmount_timeout            \
+             default_try_lazy_unmount           \
+             default_start_services             \
+             default_stop_services              \
+             default_ignore_start_service_error \
+             default_ignore_stop_service_error  \
+             default_ignore_unmount_error       \
+             default_ignore_kill_process_error  \
+             default_partgrator_pre_mount       \
+             default_partgrator_post_mount      \
+             default_partgrator_unmount         \
+             log_tag                            \
+             logfile                            \
+             logfile_date_format                \
+             logfile_newline                    \
+             logfile_stamp                      \
+             logger_flags                       \
+             mount_timeout                      \
+             unmount_timeout                    \
+             try_lazy_unmount                   \
+             start_services                     \
+             stop_services                      \
+             ignore_start_service_error         \
+             ignore_stop_service_error          \
+             ignore_unmount_error               \
+             ignore_kill_process_error          \
+             partgrator_pre_mount               \
+             partgrator_post_mount              \
+             partgrator_unmount
+
+    unset -v partgrator_label                   \
+             partgrator_file                    \
+             partgrator_dir                     \
+             partitions_status                  \
+             migrating_file                     \
+             script_unmount                     \
+             script_services_start              \
+             script_services_stop
+
+    return 0
+}
+
+
+######### HELPERS SELF-CHECK #########
+
+check_helpers_tools || exit $?
+
+
+# EOF

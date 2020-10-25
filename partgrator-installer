@@ -1,0 +1,3543 @@
+#!/bin/sh
+
+# partgrator-installer version 1.0.0
+#
+# partgrator-installer (un)installs partgrator scripts and makes compatible devices (USB)
+#
+# For more information, issues, or assistance visit: https://github.com/caribpa/partgrator
+#
+# Author: caribpa (https://github.com/caribpa)
+#
+# Copyright 2020 caribpa
+#
+# partgrator-installer is free to use under the Artistic License 2.0
+#
+# Find the Artistic License 2.0 here: https://spdx.org/licenses/Artistic-2.0.html
+
+###### ENABLE AUTOMATIC EXPORT #######
+
+set -a    # This automatically exports every variable definition
+          # Needed for keeping the same environment if relaunching from memory
+
+
+########### USER VARIABLES ###########
+
+[    -z "${user_swapfile}"        ] &&      user_swapfile="myswap.swp"
+[    -z "${archive_swapfile}"     ] &&   archive_swapfile=0      # 0 -> default ; 1 -> ask
+
+[    -z "${jffs_scripts}"         ] &&       jffs_scripts="/jffs/scripts"
+[    -z "${jffs_addons}"          ] &&        jffs_addons="/jffs/addons"
+
+[    -z "${pre_mount_script}"     ] &&   pre_mount_script="${jffs_scripts}/pre-mount"
+[    -z "${post_mount_script}"    ] &&  post_mount_script="${jffs_scripts}/post-mount"
+
+[    -z "${disk_check_script}"    ] &&  disk_check_script="${jffs_addons}/amtm/disk-check"
+[    -z "${install_folder}"       ] &&     install_folder="${jffs_addons}/partgrator"
+
+[    -z "${partgrator_installer}" ] && partgrator_installer="${install_folder}/installer"
+[    -z "${partgrator_helpers}"   ] &&   partgrator_helpers="${install_folder}/helpers"
+[    -z "${partgrator_pre}"       ] &&       partgrator_pre="${install_folder}/pre"
+[    -z "${partgrator_post}"      ] &&      partgrator_post="${install_folder}/post"
+
+[    -z "${download_tool}"        ] &&      download_tool="curl"
+[ "y" = "${download_retries-y}"   ] &&   download_retries=3      # Unset for disabling
+[    -z "${download_override}"    ] &&  download_override=""     #   Set for enabling
+
+[    -z "${ext_max_mount_count}"  ] && ext_max_mount_count=5   # Times - Check tune2fs -c
+[    -z "${ext_check_interval}"   ] &&  ext_check_interval=7   # Days  - Check tune2fs -i
+[    -z "${ext_errors_behavior}"  ] && ext_errors_behavior="continue"  # Check tune2fs -e
+
+[    -z "${parameters}"           ] && parameters="$@"    # The script's parameters passed
+
+[ "0" = "${run_from_file:-0}"     ] &&   run_from_file=0  # Values: 0 -> false ; 1 -> true
+[ -z "${batch_mode-}" ] && [ -t 0 ] &&      batch_mode=0  # Values: 0 -> false ; 1 -> true
+
+[    -z "${tmp}"                  ] &&             tmp="/tmp"
+[    -z "${tmp_tars}"             ] &&        tmp_tars="${tmp}/${install_folder##*/}-tars"
+
+[    -z "${tar_exclude}"          ] &&                                                   \
+tar_exclude="#############################################################################
+             #
+             #   < Files and directories excluded by tar when backing up a mountpoint >
+             #
+             #############################################################################
+             #
+             # > Put one file or directory per line, or separated by a newline keyword: \n
+             # > Comments must be on their own line and start with #
+             # > Empty lines or lines with only spaces or tabs will be deleted
+             #
+             # > As tar doesn't distinguish files from directories (adding a trailing
+             # > slash to the pattern won't match anything; you can use a * wildcard after
+             # > the slash to exclude everything inside), I'll refer to both files and
+             # > directories when using the world 'file' in the rest of this description
+             #
+             # > POSIX Wildcards (glob) are supported
+             # > Escape the wildcard symbols with \ when you want to match them literally
+             # > Double quotes and symbols interpreted by the shell also need escaping
+             # > Prefix ./ to match files only on the mountpoint's root folder
+             #
+             # > Examples:
+             #   > Exclude a file inside a specific folder from the root: ./path/to/file
+             #   > Exclude a file anywhere but related to a hierarchy:      path/to/file
+             #   > Exclude a folder's content anywhere:                     folder/*
+             #   > This WON'T exclude a folder (nor a file) anywhere:       folder/
+             #
+             # > Consult -X or --exclude in busybox tar's manual for more information
+             #
+             #############################################################################
+
+             ./.minidlna
+             ./lost+found
+
+             #############################################################################
+             #
+             # > IMPORTANT: Setting the variable in the environment takes precedence
+             # >            over this variable. So none of the previously listed files
+             # >            will be excluded if you don't explicitly add them.
+             #
+             # >            You may use a \n between files to simulate new lines:
+             # >            tar_exclude='./.minidlna\n./lost+found'
+             #
+             ############################################################################"
+
+
+######################################
+###                               ####
+###  USERS DO NOT NEED TO MODIFY  ####
+###       BELOW THIS POINT        ####
+###                               ####
+######################################
+
+
+###### DISABLE AUTOMATIC EXPORT ######
+
+set +a   # Stop automatically exporting everything declared
+
+
+########### SHELL VARIABLES ##########
+
+LC_ALL=C
+  PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+
+########## GLOBAL VARIABLES ##########
+
+  partgrator_installer_link='https://github.com/caribpa/partgrator/raw/master/partgrator-installer'
+    partgrator_helpers_link='https://github.com/caribpa/partgrator/raw/master/partgrator-helpers'
+        partgrator_pre_link='https://github.com/caribpa/partgrator/raw/master/partgrator-pre'
+       partgrator_post_link='https://github.com/caribpa/partgrator/raw/master/partgrator-post'
+
+                  log_tag="partgrator-installer"
+                  logfile="${tmp}/${install_folder##*/}.log"
+      logfile_date_format="+%T"
+            logfile_stamp=''
+
+                   logger=':'        # Needed to prevent logging to the system's log
+            logger_output=''         # Show log_msg's tee output on the command line
+             logger_flags="-s"       # Make logger output to the command line
+
+            tmp_installer="${tmp}/${install_folder##*/}-${partgrator_installer##*/}"
+              tmp_helpers="${tmp}/${install_folder##*/}-${partgrator_helpers##*/}"
+                installer="$0"
+
+         user_tar_exclude="$(  printf -- '%s' "${tar_exclude}"                         \
+                             | sed 's/^[[:space:]]*//;/^#/d;s/[[:space:]]*$//;/^$/d;
+                                    s/%/\\%/g                                        ' )"
+
+        tar_preserve_code=10         # Return-code indicating to preserve ${tmp_tars} data
+
+                upgrading=0          # Values: 0 -> false ; 1 -> true
+     installation_started=0          # Values: 0 -> false ; 1 -> true
+          restore_backups=2          # Values: 0 -> false ; 1 -> true ; 2 -> skip
+
+    pre_init_tools_needed="date
+                           echo
+                           read
+                           sed
+                           tee
+                           xargs "
+
+             tools_needed="[
+                           awk
+                           blkid
+                           blockdev
+                           cat
+                           chmod
+                           cp
+                           cut
+                           df
+                           du
+                           e2fsck
+                           ejusb
+                           expr
+                           false
+                           grep
+                           kill
+                           logger
+                           mkdir
+                           mke2fs
+                           mount
+                           mv
+                           nvram
+                           printf
+                           ps
+                           rm
+                           rmdir
+                           service
+                           sleep
+                           socat
+                           swapoff
+                           sync
+                           tail
+                           tar
+                           touch
+                           tune2fs
+                           type
+                           udevtrigger
+                           umount
+                           wc
+                           ${pre_init_tools_needed}"
+
+
+##### OPERATIONS WITH VARIABLES ######
+
+[ "${batch_mode}" != "0" ] && parameters="${parameters} -y" # Run with -y if in batch-mode
+
+[ "${tmp_installer}" = "${installer}" ] && tmp_installer="${tmp_installer}.tmp"
+
+
+############## HELPERS ###############
+
+# Overriding logger with echo if it is set to : and it wasn't overridden before
+if [ "${logger}" = ':' ] && ! type logger 2>&1 | grep -q 'function'; then
+    logger() {
+        local echo="echo"
+        [ "${logfile_newline}" = "0" ] && echo="printf %s"
+        # Remove all possible logger flags
+        ${echo} "$*" | sed 's/^\(-*\([sc]\|[pt] *[^ ]*\) *\)\+//'
+        return $?
+    }
+fi
+
+# This ugly helper will be overridden by the one included in ${partgrator_helpers}
+log_msg() (
+    set -o pipefail
+      logger ${logger_flags} -t "${log_tag}" "$@"  2>&1                         \
+    | { if ! case "${logger_flags}" in *'-'[sc]*) false; esac
+        then [ -z "$*" ] && logfile='/dev/null'
+               xargs -- echo "$(   [ "${logfile_stamp-1}" = "1" ]        \
+                                || { sed 's/^'"${log_tag}"': //'; false; } \
+                                && date -- ${logfile_date_format}          )" \
+             | tee -a -- "${logfile}"                 1>&2;       fi          ; }
+    return $?
+)
+
+partgrator_help() {
+    local logfile='/dev/null'
+
+    log_msg ''
+    log_msg "Usage: ${installer} [install|uninstall|usb-creator] [-y|--yes]"
+    log_msg ''
+    log_msg "       By default (no parameters) ${installer} performs 'install'" \
+                   "followed by 'usb-creator'"
+    log_msg "       Updates are automatically detected with 'install'"
+    log_msg "       The optional -y/--yes flag skips the first prompt"
+    log_msg ''
+
+    return $?
+}
+
+relaunch_from_memory() {
+    local ret_code=0
+
+    # Don't relaunch from memory if only performing usb-creator procedure
+    # or if the current script (${installer}) is not ${partgrator_installer}
+       case "${parameters## }" in *'install'*|'-y'*|'--y'*|'') false;; esac \
+    || [ "${installer}" != "${partgrator_installer}" ]                      \
+    && return 0
+
+    if [ "${run_from_file}" = "0" ]; then
+        log_msg '[Relaunching from RAM]'
+        log_msg ''
+
+        # Relaunching from memory by exec-ing another shell which pipes the content of
+        # ${installer} (first cat) into yet another shell run with the same global
+        # variables (due to the set -a used in the first command of this script).
+        # The second cat is used to keep the piped shell interactive and will be
+        # interrupted by the first kill (which is echoed as last command to be executed
+        # by the piped shell) when normally ending the script.
+        # The third cat is used in the last pipe to keep showing the user the output
+        # of the piped shell.
+        # sed is used in the last pipe for just waiting until the piped shell starts
+        # outputting. This is crucial along with sleep to prevent the user input
+        # (from either deliberate key presses or a pipe) from reaching the piped shell
+        # while it hasn't read the whole file. When the piped shell starts outputting
+        # sed exits, the sleep is interrupted (second kill), and the user input is
+        # sent to the piped shell with the second cat.
+        # The process id of sleep is passed into the last pipe by echoing its value
+        # (actually the pid of the innermost shell which will be inherited by sleep due
+        # to exec) to stderr, and because of this, stderr is redirected into stdout for
+        # the whole sh chain in order for the last pipe to grab sleep's pid and the piped
+        # shell output (which everything goes into stderr due to logger's -s flag)
+        # It is possible to keep stdout and stderr separated by duplicating stdout into
+        # another file descriptor with 3>&1, but this is not performed here because
+        # asus merlin logger's tool only logs into the terminal if run with the -s flag
+        # which outputs into the stderr (-c outputs into the console, which i guess it is
+        # the serial console as it doesn't output into the terminal). So sending the inner
+        # pid into stderr and redirecting stderr into stdout for allowing everything (both
+        # the inner pid and the output of the piped sh) to be read by the last pipe is the
+        # simplest approach. Note that, the only change should be done in case the piped
+        # sh separates stdout from stderr is changing the file descriptor of the compound
+        # list (2>&1 to 3>&1), and redirect the output of the first echo to fd 3 instead.
+        # Then the last redirection from stdout to stderr shouldn't be necessary (the
+        # truth is that it was placed like that to preserve the original behavior of
+        # expecting the output from stderr due to logger's -s flag, which probably was
+        # chosen because stderr is usually unbuffered).
+        # Trap is used in the last pipe for preventing the last cat from being killed in
+        # case an interruption is issued (Ctrl+C). This allows the last cat to show the
+        # user the interrupt message returned by the installer before exiting.
+        # Finally, it is necessary to cat the installer inside a subshell for catching its
+        # exit statement and allowing to execute the kill command before exiting the shell
+        # Also the subshell is necessary the same way the compound-list before that is:
+        # {}, for preventing the piped shell from complaining about syntax errors if it
+        # is unable to read the end of a conditional (if-fi) due to (probably) buffering
+        # in the pipe.
+        exec sh -c '  {   sh -c "sh -c \"echo \\\$\\\$ >&2                         ; \
+                                         echo \{ \(                                ; \
+                                         cat        "'"${installer}"'"             ; \
+                                         echo                          \)     \;   ; \
+                                         echo    kill -s INT \$\$ 2\>/dev/null\; \}; \
+                                         exec sleep 999                             \";\
+                                 exec cat                                              "\
+                        | sh                                                          ; }\
+                      2>&1                                       \
+                    | ( read pid; sed "q"; kill -s INT ${pid}; \
+                        trap "" EXIT KILL QUIT INT;   exec cat ) >&2                     '
+
+        log_msg ''
+        log_msg -p warning "Using fallback mechanisms for relaunching from RAM"
+        log_msg ''
+
+        # Check if sh complains about argument list too long
+        if sh -c "_wrap(){ $(sed '$d' "${installer}");};: ${parameters}; exit" 2>/dev/null
+        then
+            # Relaunching from memory by exec-ing another shell with a command consisting
+            # in a function call, composed of the same content of this script minus the
+            # EOF at the end, with ${parameters} ($@)
+            exec sh -c "_wrap(){ $(sed '$d' "${installer}"); }; _wrap ${parameters}"
+            ret_code=$?
+        else
+            # Executing the file from the ${tmp} folder
+            if [ "${installer}" != "${tmp_installer}" ]; then
+                   cp -p -- "${installer}" "${tmp_installer}"                   \
+                || { ret_code=$?
+                     log_msg -p error "cp failed with error code ${ret_code}" \
+                                      "when trying to copy ${installer}"      \
+                                      "into ${tmp_installer}"                 ; }
+            fi
+            if [ ${ret_code} -eq 0 ]; then
+                run_from_file=1 exec sh "${tmp_installer}" ${parameters}
+                ret_code=$?
+            fi
+        fi
+
+        log_msg 'There was an error when launching the script from memory'
+        log_msg ''
+        log_msg 'You may try again in case there is not enough memory'
+        log_msg ''
+        log_msg 'As a last resort, run it with $run_from_file set to true:'
+        log_msg "    \$run_from_file=1 ${installer} ${parameters}"
+        log_msg ''
+        log_msg 'Note that overriding the installer when running with $run_from_file' \
+                'may result in unexpected behavior'
+        log_msg ''
+    else
+        log_msg -p warning "Performing an install operation that results in overriding" \
+                           "the installer currently running (${installer}) may cause"   \
+                           "errors in execution and/or unexpected behavior"
+        log_msg ''
+        log_msg -p warning "Run ${installer} without setting the \$run_from_file flag," \
+                           "or copy the installer elsewhere before running it if you"   \
+                           "want to avoid unexpected behavior"
+
+        if case "${parameters}" in '-y'*|'--y'*|*' -y'*|*' --y'*) false;; esac; then
+            log_msg ''
+            log_msg 'Press <Enter> to proceed'
+            read || return $?
+        fi
+        log_msg ''
+    fi
+
+    return ${ret_code}
+}
+
+setup_downloader() {
+    local download_retries="${download_retries}"
+
+    log_msg 'Locating tool for downloading the scripts'
+    log_msg ''
+
+    if ! type ${download_tool} >/dev/null 2>&1; then
+        log_msg -p warning "'${download_tool}' not found, locating another tool"
+        case "${download_tool}" in
+            curl) type wget >/dev/null 2>&1 && download_tool="wget";;
+               *) type curl >/dev/null 2>&1 && download_tool="curl";;
+        esac
+        if [ $? -ne 0 ]; then
+            log_msg -p error "No other tool for downloading (curl, wget) could be found"
+            return 1
+        fi
+        log_msg -p warning "'${download_tool}' will be used for downloading"
+    fi
+    log_msg "'${download_tool}' will be used to perform downloads"
+
+    if [ -n "${download_retries}" ]; then
+        case "${download_tool}" in
+            curl) download_retries="--retry ${download_retries}";;
+            wget) download_retries="--tries ${download_retries}";;
+        esac
+    fi
+    case "${download_tool}" in
+        curl) download_tool="curl -s -L ${download_retries} -o";;
+        wget) download_tool="wget -q    ${download_retries} -O";;
+    esac
+
+    return 0
+}
+
+# This helper will be overridden by the one included in ${partgrator_helpers}
+check_tools() {
+    local tools_needed="$1"
+    local         tool='';
+
+    local          IFS=$' \n\t\r'
+
+    log_msg "Checking if the necessary tools can be found"
+    log_msg ''
+
+    for tool in ${tools_needed}; do
+        if ! type "${tool}" >/dev/null 2>/dev/null; then
+            log_msg -p error "System does not include tool '${tool}'" \
+                             "required by partgrator"
+            return 1
+        fi
+    done
+
+    log_msg "All necessary tools found"
+    return 0
+}
+
+downloader() {
+    local    src_link="$1"
+    local   dest_file="$2"
+
+    local dest_folder="${dest_file%/*}"
+
+    local    ret_code=0
+
+    log_msg "Downloading ${src_link} as ${dest_file}"
+    log_msg ''
+
+    if [ ! -d "${dest_folder}" ]; then
+        log_msg -p error "Destination folder (${dest_folder}) does not exist"
+        return 1
+    fi
+
+    if [ -f "${dest_file}" ] && [ ${upgrading} -eq 0 ]; then
+        log_msg -p warning "File ${dest_file} already exists"
+        log_msg ''
+        if [ -z "${download_override}" ]; then
+            log_msg -p warning "Continuing installation with existing file"
+            return 0
+        fi
+        log_msg -p warning "Overriding ${dest_file}"
+        log_msg ''
+    fi
+
+    eval "${download_tool} '${dest_file}' -- '${src_link}'"
+    ret_code=$?
+
+    if [ ${ret_code} -ne 0 ]; then
+        log_msg -p error "${download_tool%% *} failed with error code ${ret_code}" \
+                         "when trying to download ${src_link} as ${dest_file}"
+    else
+        log_msg "Download completed"
+        sync
+
+        # Check if the file was downloaded correctly by looking for EOF at its end
+           [ "$(tail -n -1 "${dest_file}")" = '# EOF' ]                       \
+        || { ret_code=$?
+             log_msg -p error "${dest_file} wasn't downloaded correctly as" \
+                              "'# EOF' is missing at its end"               ; }
+    fi
+
+    return ${ret_code}
+}
+
+check_disk_check() {
+    log_msg "Checking if disk-check script (${disk_check_script}) is set up"
+
+    if [ ! -f "${pre_mount_script}" ]; then
+        log_msg -p error "No pre-mount script (${pre_mount_script}) found"
+        log_msg -p error "Please install disk-check or update the pre_mount_script"  \
+                         "environment variable so that disk-check can be located"
+        log_msg -p error "Note that you may override some of the script's variables" \
+                         "using the environment"
+        return 1
+    elif ! grep -q -- "[^#]*${disk_check_script}" "${pre_mount_script}"; then
+        log_msg -p error "No disk-check (${disk_check_script}) could be found at"    \
+                         "${pre_mount_script}"
+        log_msg -p error "Please install it or make sure that it is uncommented and" \
+                         "try again"
+        log_msg -p error "Note that you may override some of the script's variables" \
+                         "using the environment"
+        return 2
+    fi
+
+    log_msg "disk-check script (${disk_check_script}) found in ${pre_mount_script}"
+    return 0
+}
+
+partgrator_check_tools() {
+    local IFS=$'\n'
+
+    log_msg     $'\n'
+    log_msg     "[Main phase]"
+
+    check_tools "${tools_needed}"
+    return $?
+}
+
+partgrator_banner() {
+    local answer=''
+
+    log_msg ""
+    log_msg '----------------------<Starting partgrator installer>----------------------'
+    log_msg ''
+    log_msg "For information, assistance or reporting an issue visit:"
+    log_msg "    https://github.com/caribpa/partgrator"
+    log_msg $'\n'
+    log_msg "Tip: When answering prompts press the <Enter> key to choose" \
+            "the [default option]"
+    log_msg "Tip: You may answer the yes/no questions with y/n, or the numbers 1 or 2"
+    log_msg ''
+    log_msg '---------------------------------------------------------------------------'
+
+    if case "${parameters}" in '-y'*|'--y'*|*' -y'*|*' --y'*) false;; esac; then
+        log_msg ''
+        log_msg 'Press <Enter> to proceed'
+        read || return $?
+    fi
+
+    log_msg $'\n'
+
+    return 0
+}
+
+partgrator_recovery() {
+    local answer=''
+
+    log_msg $'\n'
+    log_msg "<Starting partgrator's recovery>"
+    log_msg ''
+
+    if { [ -e "${install_folder}/"*.bak ] 2> /dev/null; [ $? -ne 1 ]; }; then
+        log_msg -p info "Found backup scripts in ${install_folder}"
+        log_msg ''
+
+        verify_backup_scripts || return $?
+
+        { [ -e "${install_folder}/"*.bak ] 2> /dev/null; [ $? -eq 1 ]; } && return 0
+
+        log_msg ''
+           answer="$(prompt_msg 'Do you wish to recover them?' '[yes]' 'no')" \
+        || return $?
+        log_msg ''
+
+        if [ "${answer}" = 'yes' ]; then
+            restore_backups=1
+            restore_backup_scripts || return $?
+        else
+            log_msg -p warning "Skipping old recovery scripts"
+        fi
+    else
+        log_msg "Nothing to recover"
+    fi
+
+    return 0
+}
+
+
+partgrator_scripts_wizard() {
+    local       re='re'
+
+    local      IFS=$'\n'
+    local   answer=''
+
+    local ret_code=0
+
+    case "${parameters}" in 'usb-creator'*) return 0;; esac
+
+    log_msg $'\n'
+    log_msg "<Starting partgrator's scripts wizard>"
+    log_msg ''
+
+    case "${parameters}" in
+        'uninstall'*|*' uninstall'*) uninstall_partgrator; return $?;;
+        '-y'*|*' -y'*|'--y'*|*' --y'*)                             :;;
+        *) log_msg "This wizard installs and uninstalls the partgrator scripts"
+           log_msg "You may run this installer with 'install' or 'uninstall'" \
+                   "as parameter to only perform the chosen operation"
+           log_msg ''
+    esac
+
+    check_disk_check || return $?
+
+    log_msg $'\n'
+
+    check_partgrator
+    ret_code=$?
+
+    if [ ${ret_code} -eq 0 ]; then
+        log_msg ''
+        log_msg "ATTENTION: All the User variables defined in the old" \
+                "partgrator scripts will be overridden"
+
+        if case "${parameters}" in '-y'*|'--y'*|*' -y'*|*' --y'*) false;; esac; then
+            log_msg ''
+            log_msg 'Press <Enter> to proceed'
+            read || return $?
+        fi
+    fi
+
+    log_msg ''
+
+       [ ${ret_code} -eq 0 ] \
+    && ! check_updates       \
+    || re=''
+
+    log_msg ''
+
+    if [ ${upgrading} -eq 0 ]; then
+       if ! case "${parameters}" in '-y'*|'--y'*|*' -y'*|*' --y'*) false;; esac; then
+           log_msg "Performing the ${re}installation of partgrator scripts"
+           answer='yes'
+       else
+              answer="$(prompt_msg "Would you like to ${re}install" \
+                                   "the partgrator scripts?"        \
+                                   'yes' '[no]'                     )"\
+           || return $?
+       fi
+    else
+        answer='yes'
+    fi
+
+       [ "${answer}" = "yes" ]                                          \
+    && { if [ -n "${re}" ] && [ ${upgrading} -eq 0 ]; then
+            log_msg ''
+               answer="$(prompt_msg "Would you like to override the" \
+                                    "existing partgrator scripts?"   \
+                                    'yes' '[no]'                     )" \
+            || return $?
+            [ "${answer}" = 'yes' ] && download_override=1
+         fi
+
+         log_msg ''
+         install_partgrator || return $?
+
+         log_msg ''
+         if ! check_partgrator; then
+             log_msg ''
+             log_msg -p error "partgrator couldn't be ${re}installed," \
+                              "check previous lines for details"
+             return 1
+         fi
+
+         log_msg ''
+         log_msg "partgrator was ${re}installed successfully"          ; }
+
+    return 0
+}
+
+check_partgrator() {
+    log_msg "Checking partgrator installation"
+    log_msg ''
+
+    if   [ ! -d "${install_folder}"       ]; then
+        log_msg -p error "Installation folder (${install_folder})"   "does not exist"
+    elif [ ! -f "${partgrator_installer}" ]; then
+        log_msg -p error "Installer script (${partgrator_installer})""does not exist"
+    elif [ ! -f "${partgrator_helpers}"   ]; then
+        log_msg -p error "Helper script (${partgrator_helpers})"     "does not exist"
+    elif [ ! -f "${partgrator_pre}"       ]; then
+        log_msg -p error "Pre-mount script (${partgrator_pre})"      "does not exist"
+    elif [ ! -f "${partgrator_post}"      ]; then
+        log_msg -p error "Post-mount script (${partgrator_post})"    "does not exist"
+    elif ! grep -q -- "[^#]*${partgrator_pre}"  "${pre_mount_script}";  then
+        log_msg -p error "Pre-mount script (${partgrator_pre}) not found in" \
+                         "${pre_mount_script}"
+        log_msg ''
+        log_msg -p error "Please make sure that a '. ${partgrator_pre}' line exists" \
+                         "and it is uncommented before trying again, otherwise"      \
+                         "you may need to reinstall partgrator"
+    elif ! grep -q -- "[^#]*${partgrator_post}" "${post_mount_script}"; then
+        log_msg -p error "Post-mount script (${partgrator_post}) not found in" \
+                         "${post_mount_script}"
+        log_msg ''
+        log_msg -p error "Please make sure that a '. ${partgrator_post}' line exists" \
+                         "and it is uncommented before trying again, otherwise"       \
+                         "you may need to reinstall partgrator"
+    else
+        log_msg "partgrator is installed"
+        return 0
+    fi
+    log_msg ''
+    log_msg -p error "partgrator is not installed or something is missing"
+    return 1
+}
+
+check_updates() {
+    local         current_version=''
+    local          remote_version=''
+
+    local current_version_segment=''
+    local  remote_version_segment=''
+
+    local                 version=''
+
+    local                  answer=''
+    local                ret_code=0
+
+    log_msg "Checking for updates"
+    log_msg ''
+
+       current_version="$(awk '/version/{print $NF; exit}' "${partgrator_pre}")" \
+    || { ret_code=$?
+         log_msg -p error "awk failed with error code ${ret_code} when"        \
+                          "retrieving the version number of ${partgrator_pre}"
+         return ${ret_code}                                                    ; }
+
+       expr "${current_version}" : '[0-9]\+\.[0-9]\+\.[0-9]\+' > /dev/null      \
+    || { log_msg -p error "Unable to find a valid version in ${partgrator_pre}"
+         return 2                                                             ; }
+
+       remote_version="$(set -o pipefail
+                           eval ${download_tool} "- --header 'Range: bytes=0-51' \
+                                                  --     '${partgrator_pre_link}'" \
+                         | awk '/version/{print $NF; exit}'                        )" \
+    || { ret_code=$?
+         log_msg -p error "${download_tool%% *} failed with error code ${ret_code}" \
+                          "when downloading ${partgrator_pre_link}"
+         return ${ret_code}                                                         ; }
+
+       expr "${remote_version}" : '[0-9]\+\.[0-9]\+\.[0-9]\+' > /dev/null            \
+    || { log_msg -p error "Unable to find a valid version in ${partgrator_pre_link}"
+         return 2                                                                  ; }
+
+    while [ "${version}" != '[0-9]\+\.[0-9]\+\.[0-9]\+' ]; do
+        version="${version}${version:+\\.}"
+
+        current_version_segment="$(expr "${current_version}" : "${version}\([0-9]\+\)")"
+         remote_version_segment="$(expr  "${remote_version}" : "${version}\([0-9]\+\)")"
+
+        if [ ${remote_version_segment} -gt ${current_version_segment} ]; then
+            log_msg ''
+            if ! case "${parameters}" in '-y'*|'--y'*|*' -y'*|*' --y'*) false;; esac; then
+                log_msg -p info "Upgrading scripts from ${current_version}" \
+                                "to ${remote_version}"
+            else
+                log_msg -p info "Scripts can be updated from ${current_version}" \
+                                "to ${remote_version}"
+                log_msg ''
+
+                   answer="$(prompt_msg 'Do you wish to update?' '[yes]' 'no')" \
+                || exit $?
+
+                [ "${answer}" = 'no' ] && break
+            fi
+
+                    upgrading=1
+            download_override=1
+
+            return 0
+        fi
+
+        version="${version}"'[0-9]\+'
+    done
+
+    log_msg "No updates found"
+
+    return 1
+}
+
+backup_mount_scripts() {
+    local  mount_script=''
+    local backup_script=''
+    local      ret_code=0
+
+    log_msg "Backing up ${pre_mount_script} and ${post_mount_script}"
+    log_msg ''
+
+    for mount_script in "${pre_mount_script}" "${post_mount_script}"; do
+        backup_script="${install_folder}/${mount_script##*/}.bak"
+           cp -p -- "${mount_script}" "${backup_script}"                \
+        || { ret_code=$?
+             log_msg -p error "cp failed with error code ${ret_code}" \
+                              "when copying ${mount_script}"          \
+                              "into ${backup_script}"
+             return ${ret_code}                                       ; }
+
+           echo "# EOF" >> "${backup_script}"                               \
+        || { ret_code=$?
+             log_msg -p error "echo failed with error code ${ret_code}"   \
+                              "when appending an EOF to ${backup_script}"
+             return ${ret_code}                                           ; }
+    done
+    sync
+
+    log_msg "${pre_mount_script} and ${post_mount_script} successfully backed up"
+
+    restore_backups=1
+
+    return 0
+}
+
+backup_partgrator_scripts() {
+    local partgrator_script=''
+    local          ret_code=0
+
+    # Return if there are no files in the folder
+    { [ -e "${install_folder}/"* ] 2>/dev/null; [ $? -eq 1 ]; } && return 0
+
+    log_msg "Backing up scripts under ${install_folder}"
+    log_msg ''
+    log_msg "${install_folder} will contain the old scripts with an added '.bak'" \
+            "extension should the installer be interrupted while updating"
+    log_msg ''
+
+    for partgrator_script in "${install_folder}/"*; do
+        # Skip everything with an extension
+        [ "${partgrator_script#*.}" != "${partgrator_script}" ] && continue
+
+           cp -p -- "${partgrator_script}" "${partgrator_script}.bak"   \
+        || { ret_code=$?
+             log_msg -p error "cp failed with error code ${ret_code}" \
+                              "when copying ${partgrator_script}"     \
+                              "into ${partgrator_script}.bak"
+             return ${ret_code}                                       ; }
+    done
+
+    log_msg "Scripts under ${install_folder} successfully backed up"
+
+    restore_backups=1
+
+    return 0
+}
+
+verify_backup_scripts() {
+    local partgrator_script=''
+    local          ret_code=0
+
+    log_msg "Verifying backup scripts under ${install_folder}"
+    log_msg ''
+
+    for partgrator_script in "${install_folder}/"*.bak; do
+        [ ! -e "${partgrator_script}" ] && continue
+
+           [ "$(tail -n -1 "${partgrator_script}")" = '# EOF' ]                     \
+        || { ret_code=$?
+             log_msg -p error   "${partgrator_script} wasn't backed up correctly" \
+             log_msg ''
+             log_msg -p warning "Removing ${partgrator_script}"
+             log_msg ''
+             rm -f -- "${partgrator_script}"                                      ; }
+    done
+
+    if [ ${ret_code} -eq 0 ]; then
+        log_msg "Backup scripts under ${install_folder} successfully verified"
+    else
+        log_msg -p warning "Some backup scripts under ${install_folder} were corrupted" \
+                           "and deleted"
+        log_msg ''
+
+           { [ -e "${install_folder}/"*.bak ] 2>/dev/null; [ $? -eq 1 ]; }               \
+        && { log_msg -p warning "All backup files under ${install_folder} were deleted"
+             return 0                                                                  ; }
+
+        log_msg -p warning "Note that some backup files being corrupted means that none" \
+                           "of the files (non-backup) were modified"
+        log_msg ''
+
+           answer="$(prompt_msg 'Do you wish to remove the remaining backup files?' \
+                                '[yes]' 'no'                                        )" \
+        || return $?
+
+           [ "${answer}" = 'yes' ]                                                      \
+        && { log_msg ''
+                rm "${install_folder}/"*.bak 2> /dev/null                     \
+             || { ret_code=$?
+                  log_msg -p error "rm failed with error code ${ret_code}"  \
+                                   "when removing all the .bak files under" \
+                                   "${install_folder}"
+                  return ${ret_code}                                        ; }
+            log_msg -p warning "All backup files under ${install_folder} were deleted"; }
+    fi
+
+    return 0
+}
+
+restore_backup_scripts() {
+    local partgrator_script=''
+    local          ret_code=0
+    local      aux_ret_code=0
+
+    [ ${restore_backups} -eq 2 ] && return 0
+
+    if [ ${restore_backups} -ne 1 ]; then
+        rm -f "${install_folder}/"*.bak
+        sync
+        return 0
+    fi
+
+    log_msg "Restoring backed up scripts under ${install_folder}"
+    log_msg ''
+
+    for partgrator_script in "${install_folder}/"*.bak; do
+        partgrator_script="${partgrator_script%.bak}"
+
+        if ! case "${partgrator_script##*/}" in 'pre-mount'|'post-mount') false;; esac
+        then
+            # Note that here the file attributes are not preserved
+            # in the incredibly unlikely case this is an issue, just use
+            # cp -p  before this sed (thus writing it twice)
+            sed '$d' "${partgrator_script}.bak"              \
+                > "${jffs_scripts}/${partgrator_script##*/}"
+        else
+            cp -p -- "${partgrator_script}.bak" "${partgrator_script}"
+        fi
+
+        ret_code=$?
+        if [ ${ret_code} -ne 0 ]; then
+            aux_ret_code=${ret_code}
+            log_msg -p error "cp failed with error code ${ret_code}" \
+                             "when restoring ${partgrator_script}"
+            log_msg ''
+        else
+            rm -f -- "${partgrator_script}.bak"
+        fi
+    done
+    sync
+
+    if [ ${aux_ret_code} -eq 0 ]; then
+        log_msg "Scripts under ${install_folder} successfully restored"
+        restore_backups=0
+    else
+        log_msg -p warning "Some ${install_folder} scripts couldn't be restored"
+        log_msg -p warning "The restore procedure will be tried again next time" \
+                           "the installer is run"
+        restore_backups=2
+    fi
+
+    return ${aux_ret_code}
+}
+
+install_partgrator() {
+    local helpers_tools_check=''
+
+    local        file_content=''
+    local                 IFS=$'\n'
+    local            ret_code=0
+
+    log_msg "Installing partgrator"
+    log_msg ''
+    installation_started=1
+
+    if [ ! -d "${install_folder}" ]; then
+        log_msg  "Creating installation folder (${install_folder})"
+        log_msg ''
+
+        mkdir -p -- "${install_folder}"
+        ret_code=$?
+
+        if [ ${ret_code} -ne 0 ]; then
+            log_msg -p error "mkdir failed with error code ${ret_code} when creating" \
+                            "${install_folder}"
+            return ${ret_code}
+        fi
+        log_msg "Installation folder (${install_folder}) successfully created"
+        log_msg ''
+    elif [ -n "${download_override}" ]; then
+        backup_partgrator_scripts || return $?
+        log_msg ''
+    fi
+    backup_mount_scripts || return $?
+
+    if [ -f "${partgrator_helpers}" ] && [ -n "${download_override}" ]; then
+        log_msg ''
+        downloader "${partgrator_helpers_link}" "${tmp_helpers}" || return $?
+
+        log_msg ''
+        log_msg "Importing ${tmp_helpers} temporarily"
+        log_msg ''
+
+        helpers_tools_check='yes'  # The new ones should be checked
+        . "${tmp_helpers}"
+    fi
+    if [ -f "${tmp_helpers}" ]; then
+        update_partgrator_dir "${tmp_helpers}" || return $?
+        update_jffs_scripts   "${tmp_helpers}" || return $?
+
+        log_msg ''
+        log_msg "Copying ${tmp_helpers} into ${partgrator_helpers}"
+
+        cp -p -- "${tmp_helpers}" "${partgrator_helpers}"
+        ret_code=$?
+        if [ ${ret_code} -ne 0 ]; then
+            log_msg -p error "cp failed with error code ${ret_code} when copying" \
+                             "${tmp_helpers} into ${partgrator_helpers}"
+            return ${ret_code}
+        fi
+
+        log_msg ''
+        log_msg "Using ${partgrator_helpers} for the rest of the script" \
+                "instead of ${tmp_helpers}"
+
+        helpers_tools_check='no'  # They where checked before
+        . "${partgrator_helpers}"
+
+        log_msg ''
+        log_msg "Removing ${tmp_helpers}"
+
+        rm -f "${tmp_helpers}"
+    fi
+
+    log_msg ''
+
+    # Relevant if using the direct shell execution one-liner
+    if    ! case "${installer}" in "${log_tag}"|"${log_tag##*-}") false;; esac \
+       && [ -z "${download_override}" ]
+    then
+        if [ "${installer}" != "${partgrator_installer}" ]; then
+            log_msg "Copying ${installer} into ${partgrator_installer}"
+
+            cp -p -- "${installer}" "${partgrator_installer}"
+            ret_code=$?
+            if [ ${ret_code} -ne 0 ]; then
+                log_msg -p error "cp failed with error code ${ret_code} when copying" \
+                                 "${installer} into ${partgrator_installer}"
+                return ${ret_code}
+            fi
+        fi
+    else
+        downloader "${partgrator_installer_link}" "${partgrator_installer}" || return $?
+    fi
+    update_partgrator_dir "${partgrator_installer}" "install_folder"        || return $?
+
+    log_msg ''
+    downloader "${partgrator_post_link}" "${partgrator_post}"               || return $?
+    update_partgrator_dir "${partgrator_post}"                              || return $?
+
+    log_msg ''
+    downloader "${partgrator_pre_link}"  "${partgrator_pre}"                || return $?
+    update_partgrator_dir "${partgrator_pre}"                               || return $?
+
+    log_msg ''
+    log_msg "Adding partgrator into the mount scripts"
+
+    log_msg ''
+    log_msg "Adding ${partgrator_pre} into ${pre_mount_script}"
+
+    file_content="$(
+       sed '/ '${partgrator_pre//\//\\\/}' \| partgrator /{
+                                                  x;$!N;s/^[[:space:]]*$\|^\n//;/^$/d};
+            / '${disk_check_script//\//\\\/}' /{
+            i. '${partgrator_pre}'  # Added by partgrator - Before '${disk_check_script}'
+            }'                                                                          \
+           "${pre_mount_script}"                                                        )"
+    ret_code=$?
+
+    if [ ${ret_code} -ne 0 ]; then
+        log_msg -p error "sed failed with error code ${ret_code} when modifying" \
+                         "${pre_mount_script}"
+        return ${ret_code}
+    fi
+
+    printf '%s' "${file_content}${file_content:+${IFS}}" > "${pre_mount_script}"
+    ret_code=$?
+
+    if [ ${ret_code} -ne 0 ]; then
+        log_msg -p error "printf failed with error code ${ret_code} when writing to" \
+                         "${pre_mount_script}"
+        return ${ret_code}
+    fi
+
+    if [ ! -f "${post_mount_script}" ]; then
+        log_msg ''
+        log_msg -p warning "${post_mount_script} does not exist, creating it"
+
+           echo '#!/bin/sh' > "${post_mount_script}"                      \
+        || { ret_code=$?
+             log_msg -p error "echo failed with error code ${ret_code}" \
+                              "when creating ${post_mount_script}"
+             return ${ret_code}                                         ; }
+    elif [ ! -x "${post_mount_script}" ]; then
+        log_msg ''
+        log_msg -p warning "${post_mount_script} doesn't have execution permissions"
+    fi
+
+    if [ ! -x "${post_mount_script}" ]; then
+        log_msg ''
+        log_msg "Giving execution permissions to ${post_mount_script}"
+
+           chmod a+x "${post_mount_script}"                                            \
+        || { ret_code=$?
+             log_msg -p error "chmod failed with error code ${ret_code} when"        \
+                              "giving execution permissions to ${post_mount_script}"
+             return ${ret_code}                                                      ; }
+    fi
+
+    log_msg ''
+    log_msg "Adding ${partgrator_post} into ${post_mount_script}"
+
+    file_content="$(
+       sed '/ '${partgrator_post//\//\\\/}' \| partgrator /{
+                                                x;$!N;s/^[[:space:]]*$\|^\n//;/^$/d};
+            2{/^[[:space:]]*$/!s/^/\n/};
+            1a\\n. '${partgrator_post}'  # Added by partgrator - First to be executed' \
+           "${post_mount_script}"                                                      )"
+    ret_code=$?
+
+    if [ ${ret_code} -ne 0 ]; then
+        log_msg -p error "sed failed with error code ${ret_code} when modifying" \
+                         "${post_mount_script}"
+        return ${ret_code}
+    fi
+
+    printf '%s' "${file_content}${file_content:+${IFS}}" > "${post_mount_script}"
+    ret_code=$?
+
+    if [ ${ret_code} -ne 0 ]; then
+        log_msg -p error "printf failed with error code ${ret_code} when writing to" \
+                         "${post_mount_script}"
+        return ${ret_code}
+    fi
+
+    log_msg ''
+    log_msg "partgrator was successfully added into the mount scripts"
+
+    sync
+
+    log_msg ''
+    log_msg "Finished installing partgrator"
+
+    restore_backups=0
+
+    installation_started=0
+
+    return 0
+}
+
+uninstall_partgrator() {
+    local file_content=''
+    local       answer=''
+    local          IFS=$'\n'
+    local     ret_code=0
+
+    log_msg "Uninstalling partgrator"
+    log_msg ''
+
+    check_partgrator
+
+    if case "${parameters}" in '-y'*|'--y'*|*' -y'*|*' --y'*) false;; esac; then
+        log_msg $'\n'
+            answer="$(prompt_msg 'Are you sure you wish to continue?' \
+                                 'yes' '[no]'                         )" \
+        || return $?
+
+        [ "${answer}" = "no" ] && return 1
+    fi
+
+    installation_started=1
+
+    log_msg $'\n'
+    log_msg "Removing partgrator from the mount scripts"
+    log_msg $'\n'
+
+       file_content="$(sed '/ '${partgrator_pre//\//\\\/}' /d' \
+                           "${pre_mount_script}"               )"    \
+    || { ret_code=$?
+         log_msg -p error "sed failed with error code ${ret_code}" \
+                          "when removing ${partgrator_pre} call"   \
+                          "from ${pre_mount_script}"
+         return ${ret_code}                                        ; }
+
+       printf '%s' "${file_content}${file_content:+${IFS}}" > "${pre_mount_script}"     \
+    || { ret_code=$?
+         log_msg -p error "printf failed with error code ${ret_code} when writing to" \
+                          "${pre_mount_script}"
+         return ${ret_code}                                                           ; }
+
+    log_msg "${partgrator_pre} call removed from ${pre_mount_script}"
+    log_msg ''
+
+       file_content="$(sed '/ '${partgrator_post//\//\\\/}' /{
+                             x;$!N;s/^[[:space:]]*$\|^\n//;/^$/d}' \
+                            "${post_mount_script}"                 )" \
+    || { ret_code=$?
+         log_msg -p error "sed failed with error code ${ret_code}" \
+                          "when removing ${partgrator_post} call"  \
+                          "from ${post_mount_script}"
+         return ${ret_code}                                        ; }
+
+       printf '%s' "${file_content}${file_content:+${IFS}}" > "${post_mount_script}"    \
+    || { ret_code=$?
+         log_msg -p error "printf failed with error code ${ret_code} when writing to" \
+                          "${post_mount_script}"
+         return ${ret_code}                                                           ; }
+
+    log_msg "${partgrator_post} call removed from ${post_mount_script}"
+    log_msg $'\n'
+
+    log_msg "partgrator was successfully removed from the mount scripts"
+    log_msg $'\n'
+
+    log_msg "Removing installation folder (${install_folder})"
+
+       rm -rf -- "${install_folder}"                                  \
+    || { ret_code=$?
+         log_msg -p error "rm failed with error code ${ret_code}"   \
+                          "when trying to remove ${install_folder}"
+         return ${ret_code}                                         ; }
+    log_msg "Installation folder (${install_folder}) was successfully removed"
+
+    sync
+
+    log_msg $'\n'
+    log_msg "Finished uninstalling partgrator"
+    installation_started=0
+
+    return 0
+}
+
+update_partgrator_dir() {
+    local partgrator_file="$1"
+    local  partgrator_dir="${2:-partgrator_dir}"
+
+    local    file_content=''
+    local             IFS=$'\n'
+
+    local        ret_code=0
+
+    # Update partgrator installation folder of helpers in case of a user customization
+       file_content="$(
+            sed '1,/'${partgrator_dir}'/{
+                 s/\('${partgrator_dir}'="\)[^"]*/\1'${install_folder//\//\\\/}'/}' \
+                "${partgrator_file}"                                                )" \
+    || { ret_code=$?
+         log_msg -p error "sed failed with error code ${ret_code}"  \
+                          "when updating \$${partgrator_dir} value" \
+                          "with ${install_folder}"
+         return ${ret_code}                                         ;                  }
+
+    [ -z "${file_content}" ] 2> /dev/null && { > "${partgrator_file}"; return 0; }
+
+    cat > "${partgrator_file}" <<EOF
+${file_content}
+EOF
+    ret_code=$?
+       [ ${ret_code} -ne 0 ]                                                     \
+    && log_msg -p error "cat failed with error code ${ret_code} when writing to" \
+                        "${partgrator_file}"
+
+    return ${ret_code}
+}
+
+update_jffs_scripts() {
+    local partgrator_file="$1"
+
+    local    jffs_scripts="${jffs_scripts%/}"  # Trim trailing slash
+    local    file_content=''
+    local             IFS=$'\n'
+
+    local        ret_code=0
+
+    # Update jffs scripts folder in case of a user customization
+       file_content="$(sed 's/\/jffs\/scripts\//'${jffs_scripts//\//\\\/}'\//' \
+                           "${partgrator_file}"                                )" \
+    || { ret_code=$?
+         log_msg -p error "sed failed with error code ${ret_code}"  \
+                          "when replacing /jffs/scripts"            \
+                          "with ${jffs_scripts}"
+         return ${ret_code}                                         ;             }
+
+    [ -z "${file_content}" ] 2> /dev/null && { > "${partgrator_file}"; return 0; }
+
+    cat > "${partgrator_file}" <<EOF
+${file_content}
+EOF
+    ret_code=$?
+       [ ${ret_code} -ne 0 ]                                                     \
+    && log_msg -p error "cat failed with error code ${ret_code} when writing to" \
+                        "${partgrator_file}"
+
+    return ${ret_code}
+}
+
+prompt_msg() {
+    local       param_one=''
+    local       param_two=''
+    local         default=''
+
+    local  break_on_param=$(($# - 2))  # Used for isolating the last two arguments
+
+    local          params=''
+    local           param=''
+    local         message=''
+
+    local         confirm=''
+    local          cancel=''
+
+    local             min=''
+    local             max=''
+    local param_separator=''
+
+    local logfile_newline=0
+
+    local          answer=''
+    local         default=''
+    local        ret_code=0
+    local             pid=0
+    local             IFS=$'\n'
+
+    if [ ${break_on_param} -lt 1 ]; then
+        log_msg -p error "prompt_msg requires at least 3 parameters"
+        return 10
+    fi
+
+    for param; do
+        params="${params}$1 "
+        shift
+        [ $((--break_on_param)) -eq 0 ] && break
+    done
+      message="${params% }"
+    param_one="$1"
+    param_two="$2"
+
+    if [ -z "${param_one}" ] && [ -z "${param_two}" ]; then
+        log_msg -p error "prompt_msg requires that at least one of" \
+                         "the two last parameters is not empty"
+        return 11
+    fi
+
+    if [ "${batch_mode}" = "0" ]; then
+        # Ignore everything typed by accident (everything before the last <Enter> pressed)
+        sh -c 'echo $$; exec cat' | { read pid; awk "BEGIN{exit}"; kill -s INT ${pid}; }
+    fi
+
+    if [ -n "${param_one}" ] && [ -n "${param_two}" ]; then
+        confirm="${param_one}"
+         cancel="${param_two}"
+
+        # Detect default parameter by removing the enclosing brackets
+             default="$(expr "${confirm}" : '\[\([^]]*\)\]')" && confirm="${default}"    \
+        || { default="$(expr "${cancel}"  : '\[\([^]]*\)\]')" &&  cancel="${default}"; } \
+        || { log_msg -p error "prompt_msg requires that one of the choices must be"    \
+                              "enclosed in [] to set it as the default choice"
+             return 12                                                                 ; }
+
+        # Detect if the parameters are numbers as they'd create a range if they are
+                    min="${confirm##*[^0-9]*}"
+                    max="${cancel##*[^0-9]*}"
+        param_separator='-'
+
+        # If any of them is not a number then the range will be 1-2
+        if [ -z "${min}" ] || [ -z "${max}" ]; then
+                        min=1
+                        max=2
+            param_separator='/'
+        fi
+        if [ "${confirm}" = "${cancel}" ]; then  # Prettify choices if they are the same
+                        max=${min}
+                     cancel=''
+            param_separator=''
+        fi
+
+        while :; do
+            log_msg "${message}" "(${confirm}${param_separator}${cancel}) [${default}]: "
+            read answer
+            ret_code=$?
+            case "${answer}" in ""|[${min}-${max}])                                break;;
+                                "${confirm}"|"${cancel}")                          break;;
+                                "${confirm%${confirm#?}}"|"${cancel%${cancel#?}}") break;;
+            esac
+            # Saving wrong answer in ${logfile} but not echoing it
+            ( logger_output="> /dev/null" log_msg "${answer}" $'\n' > /dev/null )
+            # Using a subshell because this version of ash (1.25.1) overrides the variable
+            # in the outer scope instead of just declaring it as local for the function
+        done
+
+        # If the params are not numbers and the prompt was answered with the quick-numbers
+        # then translate the number to the corresponding parameter
+           [   -z "${param_one##*[^0-9]*}" ] || [ -z "${param_two##*[^0-9]*}" ]          \
+        && {   [   "${answer}" = "${min}"                  ] && answer="${confirm}"  \
+            || { [ "${answer}" = "${max}"                  ] && answer="${cancel}" ; } \
+            || { [ "${answer}" = "${confirm%${confirm#?}}" ] && answer="${confirm}"; } \
+            || { [ "${answer}" = "${cancel%${cancel#?}}"   ] && answer="${cancel}" ; } ; }
+    else
+           [   -n "${param_one}" ] && default="${param_one}"  \
+        || { [ -n "${param_two}" ] && default="${param_two}"; }
+
+        log_msg "${message}" "[${default}]: "
+        read answer
+        ret_code=$?
+    fi
+    [ ${ret_code} -ne 0 ] && { echo 1>&2; return 13; } # prettifying output if error
+
+    [  -z "${answer}"   ] && answer="${default}"
+
+    logger_output="> /dev/null"           # Disabling logger's tee output
+    log_msg "${answer}" $'\n' > /dev/null # Saving answer in ${logfile} but not echoing it
+
+    echo "${answer}"
+
+    return 0
+}
+
+show_devices() {
+    local               device=''
+    local           partitions=''
+    local partitions_formatted=''
+    local           num_device=1
+
+    local ret_code=0
+
+    for device in /dev/sd? /dev/sd?[:alpha:]; do
+        [ ! -e "${device}" ] && continue
+
+           partitions="$(blkid "${device}"[0-9]*)"                         \
+        || { ret_code=$?
+             log_msg -p error "blkid failed with error code ${ret_code}" \
+                              "when processing ${device} partitions"
+             return ${ret_code}                                          ; }
+
+        partitions_formatted="$(  echo "${partitions}"                       \
+                                | sed -n '/'${device//\//\\\/}'/{
+                                            /LABEL=/!s/:.*//;
+                                            s/:[^"]*"\([^"]*\).*/ (\1)/;H};
+                                          ${g;s/^\n/: /;s/\n/ - /g;p}      ' )"
+
+        echo "$((num_device++)). ${device}${partitions_formatted}"
+    done
+
+    return 0
+}
+
+list_attributes() {
+    local        partitions="$@"
+
+    local         partition=''
+    local             label=''
+    local        filesystem=''
+
+    local partition_details=''
+    local     num_supported=0
+    local    supported_list=''
+    local  unsupported_list=''
+
+    local            answer=''
+    local          ret_code=0
+
+    echo "The output structure has the following order:"                                \
+         $'\n'"partition | filesystem | label | filesystem features | max mount count |" \
+              "check interval | errors behavior | mount opts | ext mount opts"$'\n'
+
+    for partition in ${partitions}; do
+        while :; do
+               filesystem="$(get_partition_filesystem "${partition}")"            \
+            || { log_msg ''
+                    answer="$(prompt_msg 'Do you wish to try again?' \
+                                         '[yes]' 'no'                )" \
+                 || return $?
+                 [ "${answer}" = 'yes' ] && continue
+
+                 log_msg ''
+                    answer="$(prompt_msg "Do you wish to skip ${partition}?" \
+                                         '[yes]' 'no'                        )" \
+                 || return $?
+                 [ "${answer}" = 'yes' ] && continue 2
+
+                 return 15                                                      ; }
+            break
+        done
+
+        if ! case "${filesystem}" in ext?) false;; esac; then
+               partition_details="$(get_partition_details "${partition}")" \
+            || { log_msg -p warning "Skipping ${partition}"
+                 continue                                                  ; }
+
+            supported_list="${supported_list}"$'\n'"$((++num_supported)) - ${partition}"
+            supported_list="${supported_list} | ${filesystem} | ${partition_details}"
+        else
+                       label="$(get_partition_label "${partition}")" || return $?
+
+            unsupported_list="${unsupported_list}"$'\n'"${partition} | ${filesystem}"
+            unsupported_list="${unsupported_list} | ${label}"
+        fi
+    done
+
+    [ -n "${unsupported_list}" ] && echo "Unsupported devices:${unsupported_list}"
+    [ -n   "${supported_list}" ] && echo   "Supported devices:""${supported_list}"
+
+    return ${ret_code}
+}
+
+wait_device_prompt() {
+    local   device="$1"
+
+    local   answer=''
+    local ret_code=0
+
+    while :; do
+           wait_device "${device}"                                  \
+        || { ret_code=$?
+             log_msg ''
+                answer="$(prompt_msg 'Do you wish to try again?' \
+                                     '[yes]' 'no'                )" \
+             || return $?
+                [ "${answer}" = "yes" ] \
+             && { log_msg ''
+                  ret_code=0
+                  continue            ; }                         ; }
+        break
+    done
+
+    return ${ret_code}
+}
+
+wait_partitions() {
+    local   partitions="$@"
+
+    local    partition=''
+    local       device="${partitions%%[1-9]*}"
+    local wait_timeout=0
+
+    for partition in ${partitions}; do
+        while :; do
+            wait_timeout=$((mount_timeout + 1))
+
+            log_msg ''
+            log_msg "Waiting up to ${mount_timeout} seconds for ${partition}"
+            log_msg ''
+            while [ $((--wait_timeout)) -gt 0 ]; do
+                blockdev --rereadpt "${device}" 2> /dev/null
+                sleep 1
+                [ -e "${partition}" ] && break
+            done
+               [ ${wait_timeout} -eq 0 ]                                              \
+            && { log_msg -p error   "${partition} not ready after"     \
+                                    "waiting ${mount_timeout} seconds"
+                 log_msg ''
+                 log_msg -p warning "Consider incrementing the value"               \
+                                    "of \$mount_timeout (${mount_timeout} seconds)" \
+                                    "if you think you need to wait more"
+
+                 log_msg ''
+                    answer="$(prompt_msg 'Do you wish to try again?' \
+                                         '[yes]' 'no'                )" \
+                 || return $?
+
+                 [ "${answer}" = 'yes' ] && continue
+
+                 return 1                                                           ; }
+
+            log_msg "${partition} is ready after waiting"         \
+                    "$((mount_timeout - wait_timeout)) second(s)"
+            break
+        done
+    done
+
+    return 0
+}
+
+# +---------------------------------------------------------------------
+# Inputs
+#   - list_devices
+# Outputs
+#   - device
+# +---------------------------------------------------------------------
+get_device() {
+    local list_devices="$1"
+
+    local       device=''
+    local  num_devices=0
+    local   num_device=0
+
+    local       answer=''
+
+    for device in ${list_devices}; do log_msg "${device}"; let ++num_devices; done
+
+    log_msg ''
+       answer="$(prompt_msg 'Select a device to continue with the procedure:' \
+                            '[1]' ${num_devices}                              )" \
+    || return $?
+
+    num_device="${answer}"
+        device="$(expr "${list_devices}" : '.*'${num_device}'\. \([^:]*\)')"
+
+    echo "${device}"
+
+    return 0
+}
+
+# +---------------------------------------------------------------------
+# Inputs
+#    - list_devices
+#    - device
+# Outputs
+#    - label
+# +---------------------------------------------------------------------
+get_label() {
+    local  list_devices="$1"
+    local        device="$2"
+
+    local default_label=''
+    local         label=''
+
+    local        answer=''
+
+    # This version picks the label from the partition 1
+    # new_label="$(expr "${list_devices}" :                                  \
+    #                   '.* '${device}': [^'$'\n'']*/sd[a-z]*1 (\([^)]*\)).*')"
+    #
+    # This version picks the label of the first partition (after sorting) that doesn't
+    # start with an underscore
+    # new_label="$(  echo "${list_devices}"                         \
+    #              | sed -n '/.* '${device}': /{
+    #                         s///;s/ - /\n/;s/[^)]*(_[^)]*)//g;p}' \
+    #              | tr -d '\n'                                     \
+    #              | sort                                           \
+    #              | sed '1!q;s/[^)]*(\([^)]*\))/\1/'               )"
+    #
+    # This version picks the label of any partition (order returned by blkid) that doesn't
+    # start with an underscore
+    label="$(expr "${list_devices}" :                          \
+                  '.* '${device}': [^'$'\n'']*(\([^_][^)]*\))' )"
+
+       [ -z "${label//[[:space:]]/}" ]   \
+    && default_label='Default_Partition' \
+    || default_label="${label}"
+
+    label="${default_label}"
+    while :; do
+           label="$(prompt_msg 'Choose a non-empty name for the new partition' \
+                               '(partition label)' "${label}" ''               )" \
+        || return $?
+        log_msg ''
+
+           [ -z "${label//[[:space:]]/}" ]                      \
+        && { log_msg -p warning "Empty labels are not allowed"
+             label="${default_label}"
+             continue                                         ; }
+
+        # Trimming leading and trailing whitespaces
+        label="${label#"${label%%[^[:space:]]*}"}"
+        label="${label%"${label##*[^[:space:]]}"}"
+
+           answer="$(prompt_msg "Is the name '${label}' right?" 'yes' '[no]')" \
+        || return $?
+
+        [ "${answer}" = "yes" ] && break
+        log_msg ''
+    done
+
+    echo "${label}"
+
+    return 0
+}
+
+# +---------------------------------------------------------------------
+# Inputs
+#   - list_devices
+#   - device
+#   - label
+# Outputs (packed)
+#   - filesystem
+#   - filesystem_features
+#   - mount_options
+#   - partition_root
+# +---------------------------------------------------------------------
+get_partition_attributes() (
+    local    list_devices="$1"
+    local          device="$2"
+    local           label="$3"
+
+    local       partition=''
+    local  partition_root=''
+    local      partitions=''
+    local  num_partitions=''
+    local     filesystems=''
+    local num_filesystems=''
+    local      attributes=''
+
+    local           regex=''
+    local     hide_header='| tail -n +4'  # Used for removing the attributes heading
+    local          answer=''
+
+    local             IFS=$'\n'
+
+    set -o pipefail
+
+       partition="$(expr "${list_devices}" :                                   \
+                         '.* '${device}'[^'$'\n'']* \([^ ]*\) ('${label}')' )"       \
+    && { log_msg "The chosen label (${label}) is the same as partition ${partition}"
+         log_msg ''
+         log_msg "Here are its attributes:"
+         log_msg ''
+
+            attributes="$(list_attributes "${partition}" | sed 's/^[0-9]\+ - //g')" \
+         || return $?
+
+         log_msg "${attributes/${IFS}[US][nu]*${IFS}/${IFS}}"
+                 # Interpolating \n in a string expansion apparently needs a variable
+                 # This trick is used to remove the line with the (Un)supported text
+
+         log_msg ''
+         if ! case "${attributes}" in *Supported*) false;; esac; then
+                answer="$(prompt_msg "Do you wish to format ${device} partitions" \
+                                     "using the same attributes as ${partition}?" \
+                                     '[yes]' 'no'                                 )" \
+             || return $?
+             if [ "${answer}" = 'no' ]; then
+                 attributes=''
+             fi
+         else
+             log_msg -p warning "Unfortunately ${partition} filesystem" \
+                                "is not supported"
+         fi
+         log_msg ''                                                                  ; } \
+    || hide_header=''
+
+    # Remove partitions with the reserved label (but not the derivatives)
+    regex="${list_devices// "${device%[a-z]}"[a-z][1-9] (${partgrator_label})/}"
+
+    # Assuming the devices only have one letter (/dev/sda and not /dev/sdab)
+    partitions="${device%[a-z]}[a-z][1-9]+"
+    partitions="$(  echo "${regex// /${IFS}}"                    \
+                  | awk  'match($0,/'${partitions//\//\\\/}'/){  \
+                              print substr($0,RSTART,RLENGTH) }' )"
+
+    if    case "${attributes}" in *Supported*) false;; esac                    \
+       && expr "${list_devices}" : '.* '${device}': [^'$'\n'']\+' > /dev/null
+    then
+           answer="$(prompt_msg "Do you wish to format ${device} partitions"      \
+                                "using the same attributes as a known partition?" \
+                                "[yes]" "no"                                      )" \
+        || return $?
+
+        if [ "${answer}" = 'yes' ]; then
+            log_msg ''
+
+            # TODO - Find a better way for removing the header without eval
+               attributes="$(eval 'list_attributes ${partitions}'  ${hide_header})" \
+            || return $?
+
+            log_msg   "${attributes}"
+            log_msg   ''
+
+            if ! case "${attributes}" in *Supported*) false;; esac; then
+                num_partitions="$(expr $'\n'"${attributes}" : '.*'$'\n''\([0-9]\+\) - ')"
+
+                   answer="$(prompt_msg "Which one?"              \
+                                        "[1]" "${num_partitions}" )" \
+                || return $?
+
+                attributes="Supported"$'\n'"$(expr "${attributes}" :                 \
+                                                   '.*'${answer}' - \([^'$'\n'']*\)' )"
+            else
+                log_msg -p warning "No supported filesystem found in the partitions"
+            fi
+        fi
+        log_msg ''
+    fi
+
+    if case "${attributes}" in *Supported*) false;; esac; then
+        log_msg "These are the supported ext filesystems:"
+
+        filesystems="$(awk 'match($0,/ext./){                         \
+                               print ++n " " substr($0,RSTART,RLENGTH)}' \
+                           "${proc_filesystems}"                         )"
+
+        log_msg "${filesystems}"
+
+        num_filesystems="$(expr "${filesystems}" : '.*\([0-9]\+\) .*')"
+
+        log_msg ''
+           answer="$(prompt_msg "Which filesystem do you choose for" \
+                                "formatting ${device} partitions?"   \
+                                "[1]" "${num_filesystems}"           )" \
+        || return $?
+
+        filesystem="$(expr "${filesystems}" : '.*'${answer}' \([^'$'\n'']*\).*')"
+
+        # TODO - Maybe add more possibilities for customizing
+        #      the filesystem options, attributes, etc
+        attributes="|${filesystem}|||0|0|continue||"
+
+        log_msg ''
+    else
+        # Formatting attributes for easier field extraction with cut
+        attributes="$(echo "${attributes}" | sed -n '${s/^[0-9]\+ - //g; s/ | /|/gp}')"
+         partition="${attributes%%|*}"
+
+        if [ "${partition%%[0-9]}" = "${device}" ]; then
+               answer="$(prompt_msg "Do you wish to place ${partition} data" \
+                                    "into the root folder"                   \
+                                    "of the new partition (${label})?"       \
+                                    '[yes]' 'no'                             )" \
+            || return $?
+               [ "${answer}" = 'yes' ]       \
+            && partition_root="${partition}" \
+            || log_msg ''
+        fi
+    fi
+
+    if [ -z "${partition_root}" ]; then
+        partitions="${partitions}"$'\n'
+        # Remove all partitions that are not from $device assuming no device has more
+        # than 9 partitions, meaning: partitions like /dev/sda10 or above don't exist
+        partitions="${partitions//${device%?}[!${device#${device%?}}][0-9]${IFS}/}"
+
+        if [ -n "${partitions//${IFS}/}" ]; then
+               answer="$(prompt_msg "Do you wish to choose a partition"      \
+                                    "to place its data into the root folder" \
+                                    "of the new partition (${label})?"       \
+                                    '[yes]' 'no'                             )" \
+            || return $?
+
+            if [ "${answer}" = 'yes' ]; then
+                    partitions="$(echo      "${partitions}" | grep -n .)"
+                num_partitions="$(expr $'\n'"${partitions}" : '.*'$'\n''\([0-9]\+\):')"
+
+                log_msg ''
+                log_msg "${partitions//:/ - }"
+                log_msg ''
+                   answer="$(prompt_msg "Which one?"              \
+                                        "[1]" "${num_partitions}" )" \
+                || return $?
+
+                partition_root="$(expr "${partitions}" : '.*'${answer}':\([^'$'\n'']*\)')"
+            fi
+        fi
+    fi
+
+    echo "${attributes}|${partition_root}"
+
+    return 0
+)
+
+# +---------------------------------------------------------------------
+# Inputs
+#   - mountpoint
+#   - tar_file
+#   - tar_exclude (optional)
+# +---------------------------------------------------------------------
+archive_mountpoint() (
+    local  mountpoint="$1"
+    local    tar_file="$2"
+    local tar_exclude="$3"
+
+    local      answer=''
+    local    ret_code=0
+
+    [ ! -e "${mountpoint}" ] || [ ! -e "${tar_file%/*}" ] && return 1
+
+    set -o pipefail
+
+       [ -n "${user_tar_exclude}" ] && [ -n "${tar_exclude}" ] \
+    && tar_exclude=$'\n'"${tar_exclude}"
+
+    while :; do
+        log_msg ''
+        log_msg "Saving ${mountpoint} in ${tar_file}"
+        log_msg ''
+
+        # TODO - Maybe add option for tar with bzip2
+
+        # For being able to use shell expansion to exclude paths
+        # the option -X - is required along with -f - and using
+        # shell redirection > for writing the file
+        # -X - reads the paths from the input, hence the use of
+        # the echo/printf block
+          { echo      './.__*'
+            echo      "${partgrator_file}"
+            printf -- "${user_tar_exclude}"
+            printf -- "${tar_exclude}"        ; }               \
+        |  tar -zcf - -C "${mountpoint}" -X - . > "${tar_file}"          \
+        || { ret_code=$?
+             rm -f "${tar_file}"
+             log_msg -p error "tar failed with error code ${ret_code}" \
+                              "when backing up"                        \
+                              "the data of ${mountpoint}"              \
+                              "into ${tar_file}"
+             false                                                     ; }  \
+        && { log_msg "Verifying ${tar_file}"
+                tar -zxOf "${tar_file}" > /dev/null 2> /dev/null   \
+             || { ret_code=$?
+                  log_msg -p warning "${tar_file} appears to be" \
+                                      "corrupted"
+                  false                                          ; }     \
+        && {    [ -z "$(tar -ztf "${tar_file}" | sed -n '2{p;q}')" ] \
+             && { log_msg -p warning "${tar_file} is empty," \
+                                     "removing it"
+                  rm -f -- "${tar_file}";                        : ; } \
+             || log_msg "${tar_file} looks good";                    : ; }; } \
+        || { log_msg ''
+                answer="$(prompt_msg 'Do you wish to try saving' \
+                                     "${mountpoint} data again?" \
+                                     '[yes]' 'no'                )" \
+             || return $?
+             [ "${answer}" = 'yes' ] && { ret_code=0; continue; }
+
+             log_msg ''
+                answer="$(prompt_msg 'Do you wish to cancel' \
+                                     'the procedure?'        \
+                                     '[yes]' 'no'            )" \
+             || return $?
+             [ "${answer}" = 'yes' ] && return ${ret_code}
+
+             log_msg ''
+             log_msg -p warning "Skipping ${mountpoint}"
+             ret_code=0                                         ;             }
+        break
+    done
+
+    return ${ret_code}
+)
+
+# +---------------------------------------------------------------------
+# Inputs
+#   - mountpoint
+#   - swapfiles
+#   - not_enough_space (optional)
+# Outputs
+#   - swap_exclude
+# +---------------------------------------------------------------------
+process_mountpoint_swapfiles() (
+    local          mountpoint="$1"
+    local           swapfiles="$2"
+    local    not_enough_space="$3"
+
+    local        swap_exclude=''
+
+    local mountpoint_swapfile=''
+    local            swapfile=''
+    local       swapfile_size=0
+
+    local     cannot_allocate=0
+
+    local              answer=''
+    local            ret_code=0
+
+    [ ! -e "${mountpoint}" ] && return 1
+
+    set -o pipefail
+
+    mountpoint_swapfile="${mountpoint}/${user_swapfile}"
+
+       expr "${swapfiles}"$'\n' : ".*${mountpoint_swapfile}"$'\n'".*" > /dev/null \
+    || swapfiles="${swapfiles}"$'\n'"${mountpoint_swapfile}"
+
+    swap_exclude=''
+    for swapfile in ${swapfiles}; do
+        if    [ "${swapfile#${mountpoint}}" != "${swapfile}" ] \
+           && [ -f "${swapfile}" ]
+        then
+            log_msg ''
+            log_msg "Processing ${swapfile}"
+
+            while :; do
+                   grep -q -- "^${swapfile}\>" "${proc_swaps}"                    \
+                && { log_msg ''
+                     log_msg -p warning "${swapfile} is an active swap" \
+                                        "device, disabling it"
+                     log_msg ''
+
+                     cannot_allocate="$(  swapoff -- "${swapfile}" 2>&1        \
+                                        | awk 'tolower($0) ~ "cannot allocate"')" \
+                     && { log_msg "${swapfile} disabled successfully";        :;  } \
+                     || { ret_code=$?
+                          log_msg -p error "swapoff failed with error code" \
+                                           "${ret_code} when disabling"     \
+                                           "swapfile ${swapfile}"
+                          log_msg ''
+
+                             [ -n "${cannot_allocate}" ]                      \
+                          && { log_msg -p error "Unable to allocate enough" \
+                                                "memory (RAM) to disable"   \
+                                                "${swapfile}"
+                               log_msg ''
+                               log_msg -p error "Check the page of the"     \
+                                                "project for alternatives"  \
+                                                "to work around this issue"
+                               log_msg ''                                   ;       }
+
+                             answer="$(prompt_msg 'Do you wish to try'  \
+                                                  'disabling it again?' \
+                                                  '[yes]' 'no'          )" \
+                          || return $?
+                             [ "${answer}" = 'yes' ]                       \
+                          && { ret_code=0
+
+                               log_msg ''
+                               stop_services
+
+                               log_msg ''
+                               kill_mountpoint_processes "${mountpoint}"
+                               continue                                  ; }
+
+                          log_msg ''
+                             [ -n "${cannot_allocate}" ]                     \
+                          && { answer='yes'       ;: ; }                  \
+                          || answer="$(prompt_msg 'Do you want to cancel' \
+                                                  'the procedure?'        \
+                                                  'yes' '[no]'            )" \
+                          || return $?
+                          [ "${answer}" = 'yes' ] && return ${ret_code}
+                          ret_code=0
+
+                          log_msg ''
+                          log_msg -p warning "Skipping disabling ${swapfile}"; }; }
+                break
+            done
+
+               [ "${not_enough_space}" = "1" ] || [ "${archive_swapfile}" = "1" ]    \
+            && { log_msg ''
+                    swapfile_size="$(  du -k -- "${swapfile}"                   \
+                                     | awk '{s+=$1}                           \
+                                            END{k=1024;for(s*=k;s>k;++i)s/=k;\
+                                                printf "%.1f%s",             \
+                                                       s       ,             \
+                                                       substr(" KMGTP",i+1,1)}' )" \
+                 || { ret_code=$?
+                      log_msg -p error "du failed with error code"   \
+                                       "${ret_code} when retrieving" \
+                                       "${swapfile} size"
+                         answer="$(prompt_msg 'Do you want to cancel' \
+                                              'the procedure?'        \
+                                              'yes' '[no]'            )" \
+                      || return $?
+                      [ "${answer}" = 'yes' ] && return ${ret_code}
+                      log_msg ''
+                      ret_code=0                                         ;         }
+
+                    answer="$(prompt_msg 'Do you want to save'  \
+                                         "swapfile ${swapfile}" \
+                                         "(${swapfile_size})"   \
+                                         'yes' '[no]'           )" \
+                 || return $?
+
+                    [ "${answer}" = 'no' ]                          \
+                 && {     swapfile="${swapfile#${mountpoint}}"
+                      swap_exclude="${swap_exclude}.${swapfile}\n"; }              ; }
+        fi
+    done
+
+    echo "${swap_exclude}"
+
+    return ${ret_code}
+)
+
+analyze_tmp() {
+    local tar_file=''
+
+    local   answer=''
+    local ret_code=0
+
+       clean_tmp 'analyze'                                               \
+    || { ret_code=$?
+         [ ${ret_code} -ne ${tar_preserve_code} ] && return ${ret_code}; }      \
+    && {    mkdir -- "${tmp_tars}"                                          \
+         || { ret_code=$?
+              log_msg -p error "mkdir failed with error code ${ret_code}" \
+                               "when trying to create ${tmp_tars}"
+              return ${ret_code}                                          ; } ; }
+
+    if { [ -e "${tmp_tars}/"* ] 2> /dev/null; [ $? -ne 1 ]; }; then
+        log_msg "Verifying archives under ${tmp_tars} from the previous backup process"
+        log_msg ''
+
+        for tar_file in "${tmp_tars}/"*; do
+            log_msg "Verifying ${tar_file}"
+
+               tar -zxOf "${tar_file}" > /dev/null 2> /dev/null  \
+            && { log_msg "${tar_file} appears to be correct"; :; }         \
+            || { ret_code=$?
+                 log_msg -p warning "${tar_file} appears to be corrupted"
+
+                    answer="$(prompt_msg 'Do you wish to remove it?' \
+                                         '[yes]' 'no'                )" \
+                 || return $?
+
+                   [ "${answer}" = 'yes' ]   \
+                && { rm -f -- "${tar_file}"
+                     continue              ; }
+
+                   answer="$(prompt_msg 'Do you wish to cancel' \
+                                        'the procedure?'        \
+                                        'yes' '[no]'            )" \
+                || return $?
+
+                [ "${answer}" = 'yes' ] && return ${ret_code}
+
+                log_msg -p warning "Preserving the corrupted ${tar_file}"; }
+
+            log_msg ''
+        done
+
+        log_msg "Archives verified"
+        log_msg $'\n'
+    fi
+
+    return 0
+}
+
+# +---------------------------------------------------------------------
+# Inputs
+#   - partitions
+# Outputs
+#   - not_enough_space
+# +---------------------------------------------------------------------
+analyze_partitions() (
+    local       partitions="$@"
+
+    local           device="${partitions%%[0-9]*}"
+    local not_enough_space=0
+
+    local        used_size=''
+    local    tar_used_size=''
+    local      device_size=''
+    local        partition=''
+    local         tar_file=''
+
+    local           answer=''
+    local         ret_code=0
+
+    set -o pipefail
+
+    log_msg "Analyzing ${device} space usage"
+    log_msg ''
+    log_msg "Auto-mounting all ${device} partitions"
+    reload_disks || return $?
+
+    # Big numbers are only supported by awk or expr instead of the shell $(()) or let
+    used_size=0
+    for partition in ${partitions}; do
+        while :; do
+            log_msg ''
+               wait_mountpoint "${partition}"                                     \
+            || { ret_code=$?
+                 log_msg ''
+                    answer="$(prompt_msg 'Do you wish to try again?' \
+                                         '[yes]' 'no'                )" \
+                 || return $?
+                    [ "${answer}" = 'yes' ]       \
+                 && { reload_disks || return $?
+                      continue                  ; }
+
+                 log_msg ''
+                    answer="$(prompt_msg "Do you wish to skip ${partition}?" \
+                                         '[yes]' 'no'                        )" \
+                 || return $?
+                 [ "${answer}" = 'yes' ] && continue 2
+
+                 return ${ret_code}                                             ; }
+            break
+        done
+
+           used_size=$(  df -k  -- "${partition}"                                   \
+                       | awk '{if(NR != 1){print '${used_size}' + $3 * 1024; exit}}') \
+        || { ret_code=$?
+             log_msg -p error   "df failed with error code ${ret_code}" \
+                                "when processing ${partition}"
+             log_msg -p warning "Space usage readings may be wrong"     ;             }
+    done
+
+    # It shall be noted that there seems to be a mismatch between the raw uncompressed
+    # size (reported by tar -tv), and the real size of the files on a filesystem once
+    # uncompressed (reported by du). Files residing on a ext2 filesystem occupy around
+    # 35% more than what was expected according to tar -tv
+    # This mismatch is most likely due to the fact that symlinks (especially directories)
+    # may be ignored by du and accounted as actual files. Get the real size of $path with:
+    #   find ${path} -exec sh -c '   [ ! -d "{}" ] && [ ! -L "{}" ] && [ -e "{}" ] \
+    #                             && wc -c "{}"' \; | awk '{s+=$1} END{print s}'
+
+       { [ -e "${tmp_tars}/"* ] 2> /dev/null; [ $? -ne 1 ]; }                        \
+    && { log_msg ''
+         log_msg "Taking into account the uncompressed size" \
+                 "of the archives under ${tmp_tars}"
+         tar_used_size=0
+         for tar_file in "${tmp_tars}/"*; do
+                tar_used_size=$(  tar -tzvf "${tar_file}"                        \
+                                | awk '{s+=$3} END{print '${tar_used_size}' + s}') \
+             || { ret_code=$?
+                  log_msg ''
+                  log_msg -p error   "tar failed with error code ${ret_code}" \
+                                     "when processing ${tar_file} size usage"
+                  log_msg -p warning "Space usage readings may be wrong"      ;    }
+         done
+         used_size=$(expr ${used_size} + ${tar_used_size})                         ; }
+
+    # More portable would be to retrieve the $device sectors from /sys/block/sda/size
+    # and multiply them by the sector size: /sys/block/sda/queue/hw_sector_size
+    device_size="$(blockdev --getsize64 "${device}")"
+
+    # Reduce it ~1% as the filesystems reserve some space, and reserve half for partgrator
+    device_size=$(expr ${device_size} \* 984 / 1000 / 2)
+    # ^ The 984/1000 is a magic number representing the discrepancy between the size
+    #   available (reported by df) of an ext2 partition occupying half of the device, and
+    #   the calculated real half size (reported by fdisk and dividing by 2)
+
+    if [ ${device_size} -lt ${used_size} ]; then
+        log_msg ''
+        log_msg -p warning "Current ${device} data may not fit in the new" \
+                           "partition configuration"
+
+           { [ -e "${tmp_tars}/"* ] 2> /dev/null; [ $? -ne 1 ]; }           \
+        && {        used_size=$(expr ${used_size} - ${tar_used_size})
+                tar_used_size=$(  du -k -- "${tmp_tars}/"*         \
+                                | awk '{s+=$1} END{print s * 1024}')      \
+             || { ret_code=$?
+                  log_msg ''
+                  log_msg -p error   "du failed with error code"     \
+                                     "${ret_code} when processing"   \
+                                     "${tmp_tars}/ files size usage"
+                  log_msg -p warning "Space usage readings may be wrong"; }
+
+             used_size=$(expr ${used_size} + ${tar_used_size})
+
+             log_msg ''
+                [ ${device_size} -lt ${used_size} ]              \
+             && { log_msg "Note that there's enough space for" \
+                          "the archives under ${tmp_tars} if"  \
+                          "they are kept compressed";        : ; }  \
+             || log_msg -p warning "Note that there's not enough" \
+                                   "size for the archives under"  \
+                                   "${tmp_tars} even if they are" \
+                                   "kept compressed"                ;       }
+
+        log_msg ''
+        log_msg "Not including swapfiles in the new partition will be offered" \
+                "as an option if they are found"
+        not_enough_space=1
+    fi
+
+    echo "${not_enough_space}"
+
+    return 0
+)
+
+# +---------------------------------------------------------------------
+# Inputs
+#   - partitions
+#   - not_enough_space
+#   - partition_root
+# Outputs
+#   - partition_root
+# +---------------------------------------------------------------------
+backup_partitions() {
+    local          partitions="$1"
+    local    not_enough_space="$2"
+    local      partition_root="$3"
+
+    local           partition=''
+    local          mountpoint=''
+
+    local           swapfiles=''
+    local        swap_exclude=''
+
+    local              answer=''
+
+    if [ -n "${partitions}" ]; then
+        log_msg '------------------------------------------------------------------------'
+        log_msg "Please note that any error that may happen when saving a mountpoint"    \
+                "into a .tar.gz regarding:"
+        log_msg "- gzip"
+        log_msg "- tar"
+        log_msg "- sh"
+        log_msg "- eval"
+        log_msg "- fork"
+        log_msg ''
+        log_msg "are all due to lack of RAM to temporarily store the mountpoint data"
+        log_msg ''
+        log_msg "In case the installer exists abruptly due to lack of RAM, you may free" \
+                "it yourself with the command:"
+        log_msg "rm -rf \"${tmp_tars}\""
+        log_msg ''
+        log_msg "Check the page of the project for alternatives to work around this issue"
+        log_msg '------------------------------------------------------------------------'
+        log_msg ''
+
+        if case "${parameters}" in '-y'*|'--y'*|*' -y'*|*' --y'*) false;; esac; then
+            log_msg 'Press <Enter> to proceed'
+            read || return $?
+            log_msg ''
+        fi
+
+        swapfiles="$(awk '{if(NR != 1){print $1}}' "${proc_swaps}")"
+    fi
+
+    while :; do
+           stop_services                                            \
+        || { ret_code=$?
+             log_msg ''
+                answer="$(prompt_msg 'Do you wish to try again?' \
+                                     '[yes]' 'no'                )" \
+             || return $?
+             log_msg ''
+
+             [ "${answer}" = 'yes' ] && { ret_code=0; continue; }
+
+                answer="$(prompt_msg 'Do you wish to cancel' \
+                                     'the procedure?'        \
+                                     '[yes]' 'no'            )" \
+             || return $?
+
+             [ "${answer}" = 'yes' ] && return ${ret_code}
+             ret_code=0
+
+             log_msg ''
+             log_msg -p warning "Proceeding without stopping all" \
+                                "services"                        ; }
+        break
+    done
+
+    for partition in ${partitions}; do
+        log_msg ''
+        while :; do
+               mountpoint="$(get_partition_mountpoint "${partition}")"                \
+            || { log_msg -p error "${partition} mountpoint cannot be found"
+                 log_msg ''
+
+                    answer="$(prompt_msg 'Do you wish to try locating it again?' \
+                                         '[yes]' 'no'                            )" \
+                 || return $?
+
+                 log_msg ''
+                 [ "${answer}" = 'yes' ] && reload_disks && continue
+
+                    answer="$(prompt_msg 'Do you wish to cancel the procedure?' \
+                                         '[yes]' 'no'                           )" \
+                 || return $?
+
+                 [ "${answer}" = 'yes' ] && return 14
+
+                 log_msg ''
+                 log_msg -p warning "Skipping ${partition}"
+                 log_msg $'\n'
+                 continue 2                                                         ; }
+            break
+        done
+
+        log_msg "Processing ${mountpoint} data"
+        log_msg ''
+
+        tar_file="${tmp_tars}/${mountpoint##*/}.tar.gz"
+
+        [ "${partition}" = "${partition_root}" ] && partition_root="${tar_file}"
+
+        # Under this mess of cases some tricks are used to control block flow
+        # A sneaky : or a false command may appear at the end of a block in order
+        # to force an appropriate exit code that allows to enter or ignore the
+        # next block
+           [ -f "${tar_file}" ]                                                      \
+        && { log_msg -p warning "${tar_file} exists, if kept it will be used"      \
+                                "in place of the current data under ${mountpoint}"
+             log_msg ''
+                answer="$(prompt_msg "Do you wish to override ${tar_file}" \
+                                     "with the content of ${mountpoint}?"  \
+                                     'yes' '[no]'                            )" \
+             || return $?
+
+            log_msg ''
+                [ "${answer}" = 'yes' ]                        \
+             && { log_msg -p warning "Removing ${tar_file}"
+                  rm -f -- "${tar_file}"                  ; :; } \
+             || log_msg "Continuing with ${tar_file}"
+
+             [ "${answer}" = 'no' ]                                                ; } \
+        || {    { [ -e "${mountpoint}/"*      ] 2> /dev/null; [ $? -eq 1 ]; } \
+             && { [ -e "${mountpoint}/".[!.]* ] 2> /dev/null; [ $? -eq 1 ]; } \
+             && { log_msg -p warning "${mountpoint} is empty, skipping"; :; } ;        } \
+        || { while :; do
+                    kill_mountpoint_processes "${mountpoint}"                \
+                 || { ret_code=$?
+                      log_msg ''
+                         answer="$(prompt_msg 'Do you wish to try again?' \
+                                              '[yes]' 'no'                )" \
+                      || return $?
+                      log_msg ''
+                      [ "${answer}" = 'yes' ] && { ret_code=0; continue; }
+
+                         answer="$(prompt_msg 'Do you wish to cancel' \
+                                              'the procedure?'        \
+                                              '[yes]' 'no'            )" \
+                      || return $?
+
+                      [ "${answer}" = 'yes' ] && return ${ret_code}
+                      ret_code=0
+
+                      log_msg ''
+                      log_msg -p warning "Proceeding without killing all" \
+                                         "${mountpoint} processes"        ;  }
+                 break
+             done
+
+                swap_exclude="$(process_mountpoint_swapfiles "${mountpoint}"       \
+                                                             "${swapfiles}"        \
+                                                             "${not_enough_space}" )" \
+             || return $?
+
+                archive_mountpoint "${mountpoint}"   \
+                                   "${tar_file}"     \
+                                   "${swap_exclude}" \
+             || return $?                            ;                                   }
+    done
+
+    echo "${partition_root}"
+
+    if [ -n "${partitions}" ]; then
+        log_msg ''
+        log_msg "Finished saving partitions data"
+    fi
+
+    return 0
+}
+
+unmount_device_partitions() {
+    local     device="$1"
+
+    local  partition=''
+    local mountpoint=''
+
+    local     answer=''
+    local   ret_code=0
+
+    log_msg "Unmounting ${device} partitions"
+
+    if { [ -e "${device}"?* ] 2> /dev/null; [ $? -eq 1 ]; }; then
+        log_msg ''
+        log_msg "${device} partitions are already unmounted"
+        return 0
+    fi
+
+    log_msg ''
+    stop_services
+
+    for partition in "${device}"?*; do
+        while :; do
+               mountpoint="$(get_partition_mountpoint "${partition}")"                \
+            || { ret_code=$?
+
+                 [ ${ret_code} -eq ${not_found_code} ] && { ret_code=0; break; }
+
+                 log_msg ''
+                    answer="$(prompt_msg 'Do you wish to try again?' \
+                                         '[yes]' 'no'                )" \
+                 || return $?
+                 [ "${answer}" = 'yes' ] && { ret_code=0; continue; }
+
+                 log_msg ''
+                    answer="$(prompt_msg 'Do you wish to cancel the procedure?' \
+                                         'yes' '[no]'                           )" \
+                 || return $?
+
+                 [ "${answer}" = 'yes' ] && return ${ret_code}
+                 ret_code=0
+
+                 log_msg ''
+                 log_msg -p warning "Skipping ${partition}"
+                 continue 2                                                         ; }
+            break
+        done
+
+           [ -z "${mountpoint}" ]                                               \
+        && { log_msg ''
+             log_msg -p warning "Partition ${partition} is already unmounted"
+             continue                                                         ; }
+
+        while :; do
+            log_msg ''
+               unmount_mountpoint "${mountpoint}"                                  \
+            || { ret_code=$?
+                 log_msg ''
+                    answer="$(prompt_msg 'Do you wish to try again?' \
+                                         '[yes]' 'no'                )" \
+                 || return $?
+                 [ "${answer}" = 'yes' ] && { ret_code=0; stop_services; continue; }
+
+                 log_msg ''
+                    answer="$(prompt_msg 'Do you wish to cancel the procedure?' \
+                                         'yes' '[no]'                           )" \
+                 || return $?
+                 [ "${answer}" = 'yes' ] && return ${ret_code}
+                 ret_code=0
+
+                 log_msg ''
+                 log_msg -p warning "Skipping ${mountpoint} (${partition})"         ; }
+            break
+        done
+    done
+
+    log_msg ''
+    log_msg "${device} partitions successfully unmounted"
+
+    return 0
+}
+
+process_partitions() {
+    local     list_devices="$1"
+    local           device="$2"
+    local   partition_root="$3"
+
+    local            regex=''
+    local       partitions=''
+    local not_enough_space=0
+
+    local              IFS=$'\n'
+
+    # Remove partitions with the reserved label (but not the derivatives)
+    regex="${list_devices// "${device}"[1-9] ("${partgrator_label}")/}"
+    # This will fail in the unlikely case a partition was assigned with two digits
+    # such as /dev/sda10, it will also fail to detect labels derived from
+    # $reserved_label, replace ${regex} with ${list_devices} and pipe before grep:
+    #    sed 's/ '${device//\//\\\/}'[1-9]\+ (${partgrator_label}[^)]*)//g'
+    # and the pure alternative is to use a very complex sed command
+    partitions="$(  echo "${regex// /${IFS}}"                         \
+                  | awk  'match($0,/'${device//\//\\\/}'[0-9]+/){     \
+                                    print substr($0,RSTART,RLENGTH) }')"
+
+    if [ -n "${partitions}" ]; then
+       log_msg "Processing ${device} partitions"
+       log_msg ''
+
+       not_enough_space="$(analyze_partitions "${partitions}"       )" || return $?
+       log_msg $'\n'
+
+         partition_root="$( backup_partitions "${partitions}"       \
+                                              "${not_enough_space}" \
+                                              "${partition_root}"   )" || return $?
+       log_msg $'\n'
+
+       unmount_device_partitions "${device}"                           || return $?
+       log_msg $'\n'
+
+       log_msg "${device} partitions successfully processed"
+    fi
+
+    echo "${partition_root}"
+
+    return 0
+}
+
+# +---------------------------------------------------------------------
+# Inputs
+#     - device
+# Outputs
+#     - device
+# +---------------------------------------------------------------------
+partition_device() (
+    local       device="$1"
+
+    local      sectors=''
+    local first_sector=''
+    local    partition=''
+    local     commands=''
+
+    local       delete=''
+    local       answer=''
+    local     ret_code=0
+
+    set -o pipefail
+
+    log_msg "Preparing for partitioning ${device}"
+    log_msg ''
+
+    if grep -q "^${device}" "${mtab}"; then
+        log_msg -p warning "Some ${device} partitions remain mounted"
+
+        log_msg ''
+           unmount_device_partitions "${device}"                               \
+        || { log_msg ''
+                answer="$(prompt_msg 'Are you sure you wish to continue?' \
+                                     'yes' '[no]'                         )" \
+             || return $?
+             [ "${answer}" = 'no' ] && return 17                             ; }
+        log_msg ''
+    fi
+
+    log_msg "Testing that fdisk recognizes ${device}"
+       echo q | fdisk -u "${device}" > /dev/null                         \
+    || { ret_code=$?
+         log_msg -p error "fdisk failed with error code ${ret_code}"  \
+                          "when testing compatibility with ${device}"
+         log_msg ''
+         log_msg -p error "The procedure cannot continue because either" \
+                          "${device} is damaged/not properly recognized"
+         log_msg -p error "or its partition table is not recognized by"  \
+                          "this implementation of fdisk"
+         log_msg ''
+         log_msg -p error "If the latter, change in other system the" \
+                          "${device} partition table to MBR/DOS and"  \
+                          "try again"
+         log_msg ''
+         log_msg -p error "Also creating one ext2 partition with the" \
+                          "full available ${device} space in another" \
+                          "system may do the trick"
+         return ${ret_code}                                           ;  }
+    log_msg ''
+    log_msg "${device} is compatible with fdisk"
+    log_msg ''
+
+       sectors="$(fdisk -ul "${device}" | awk '/sectors$/{print $3 " " $(NF-1); exit}')" \
+    || { ret_code=$?
+         log_msg -p error "fdisk failed with error code ${ret_code}"    \
+                          "when retrieving ${device} number of sectors"
+         return ${ret_code}                                             ;                }
+
+    delete=''
+    for partition in "${device}"?*; do
+        [ -e "${partition}" ] && delete="${delete}d\n${partition#${device}}\n"
+    done
+
+    first_sector="${sectors% *}"
+         sectors="${sectors#* }"
+
+    # Halving the sectors available
+    sectors=$(expr \( ${sectors} - 1 + ${first_sector} \) / 2)
+    # Note that this ^ is fine for a fdisk working in DOS mode such as busybox's but
+    # a modern one that detects/creates GPT tables would additionally use 32 sectors
+    # at the end of the disk for partition table redundancy
+    # If that were the case, subtract 32 to the $first_sector (probably also 32)
+
+    # Remove all partitions and create two new ones, each half the size available
+    commands="${delete}n\np\n1\n\n${sectors}\nn\np\n2\n\n\nw\n"
+
+    log_msg "Partitioning ${device}"
+    log_msg ''
+
+    # Note that fdisk will complain that a command is not found because it doesn't
+    # prompt to choose the partition to remove (d command) when only one remains
+    # This complain can be safely ignored
+       printf "${commands}" | fdisk -u "${device}" > /dev/null 2> /dev/null  \
+    || { ret_code=$?
+
+         # An alternative to using blockdev is grepping fdisk looking for:
+         #  fdisk: WARNING: rereading partition table failed, kernel still uses old table:
+         #                  Device or resource busy
+            blockdev --rereadpt "${device}" 2> /dev/null                    \
+         && { log_msg -p error "fdisk failed with error code ${ret_code}" \
+                               "when partitioning ${device}"
+              return ${ret_code}                                          ; }
+
+         log_msg -p warning "${device} was partitioned successfully," \
+                            "but the kernel is still using the old"   \
+                            "partition table"
+         log_msg ''
+         log_msg "Reloading the partition table by replugging ${device}"
+
+         log_msg ''
+         device="$(replug_device "${device}")"     || return $?
+
+         log_msg ''
+         log_msg "Waiting for the new partitions to become available"
+         wait_partitions "${device}1" "${device}2" || return $?
+
+         false                                                              ; } \
+    && log_msg "${device} was partitioned successfully!"
+
+    echo "${device}"
+
+    return 0
+)
+
+# +---------------------------------------------------------------------
+# Inputs
+#    - device
+#    - filesystem
+#    - label
+#    - filesystem_features
+#    - mount_options
+# +---------------------------------------------------------------------
+format_device() {
+    local                 device="$1"
+    local             filesystem="$2"
+    local                  label="$3"
+    local    filesystem_features="$4"
+    local        max_mount_count="$5"
+    local         check_interval="$6"
+    local        errors_behavior="$7"
+    local      new_mount_options="$8"
+    local extended_mount_options="$9"
+
+    local              partition=''
+    local             mountpoint=''
+    local      old_mount_options=''
+
+    local             bad_option=''
+    local                 answer=''
+    local               ret_code=0
+
+    log_msg "${device} partitions will be formatted"
+
+       [ -n "${filesystem_features}" ]                      \
+    && filesystem_features="-O ${filesystem_features// /,}"
+
+    # Not using shell expansion ${device}[1-2] or [12] because
+    # it doesn't guarantee that both partitions will be found
+    for partition in "1" "2"; do
+        partition="${device}${partition}"
+
+           [ ! -e "${partition}" ]                        \
+        && { log_msg ''
+             log_msg -p error "${partition} not found"
+             wait_partitions "${partition}" || return $?; }
+
+        [ "${partition}" = "${device}2" ] && label="${partgrator_label}"
+
+        log_msg ''
+        while :; do
+            log_msg "Formatting ${partition}"
+            log_msg ''
+
+            # Using mke2fs in a pipe makes it non-interactive
+            : | mke2fs -t "${filesystem}"                  \
+                       -L "${label}"                       \
+                       ${filesystem_features}              \
+                       --                                  \
+                       "${partition}"          > /dev/null 2> /dev/null                  \
+            || { ret_code=$?
+                 log_msg -p error "mke2fs failed with error code ${ret_code}" \
+                                  "when formatting ${partition}"
+                    mountpoint="$(get_partition_mountpoint "${partition}")"        \
+                 && { log_msg ''
+                      log_msg -p warning "${partition} is mounted"
+
+                      while :; do
+                          log_msg ''
+                             answer="$(prompt_msg 'Do you wish to unmount it' \
+                                                  'and try again?'            \
+                                                  '[yes]' 'no'                )" \
+                          || return $?
+                          [ "${answer}" = 'no' ] && return ${ret_code}
+                          ret_code=0
+
+                          log_msg ''
+                          unmount_device_partitions "${device}" && break
+                      done
+
+                      log_msg ''
+                      eject_device                  "${device}" || return $?
+
+                      log_msg ''
+                      wait_device_prompt            "${device}" || return $?     ; } \
+                 || { log_msg ''
+                         answer="$(prompt_msg 'Do you wish to replug'     \
+                                              'the device and try again?' \
+                                              '[yes]' 'no'                )" \
+                      || return $?
+                      [ "${answer}" = 'no' ] && return 21
+
+                      while :; do
+                          log_msg ''
+                          unmount_device_partitions "${device}" && break
+                          ret_code=$?
+                          log_msg ''
+                             answer="$(prompt_msg 'Do you wish to try again?' \
+                                                  '[yes]' 'no'                )" \
+                          || return $?
+                          [ "${answer}" = 'no' ] && return ${ret_code}
+                      done
+
+                      log_msg ''
+                      eject_device            "${device}"   || return $?
+
+                      log_msg ''
+                      wait_device_prompt      "${device}"   || return $?
+
+                      log_msg ''
+                      device="$(replug_device "${device}")" || return $?
+
+                      partition="${device}${partition##*[a-z/]}"             ;   }
+                 log_msg ''
+
+                 continue                                                        ;       }
+            break
+        done
+
+           tune2fs -c "${max_mount_count}" -- "${partition}" > /dev/null     \
+        || { ret_code=$?
+             log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                              "when setting ${partition} max mount count"
+             return ${ret_code}                                            ; }
+
+           tune2fs -i "${check_interval}" -- "${partition}" > /dev/null      \
+        || { ret_code=$?
+             log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                              "when setting ${partition} check interval"
+             return ${ret_code}                                            ; }
+
+           tune2fs -e "${errors_behavior}" -- "${partition}" > /dev/null     \
+        || { ret_code=$?
+             log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                              "when setting ${partition} errors behavior"
+             return ${ret_code}                                            ; }
+
+        if [ -n "${new_mount_options}" ]; then
+            old_mount_options="$(  tune2fs -l "${partition}"                     \
+                                 | sed -n '/^Default mount options: */{s///p;q}' )"
+
+            if [ -n "${old_mount_options}" ]; then
+                   tune2fs -o "^${old_mount_options// /,^}" -- "${partition}" >/dev/null \
+                || { ret_code=$?
+                     log_msg -p error "tune2fs failed with error code ${ret_code}"    \
+                                      "when unsetting ${partition} old mount options"
+                     log_msg ''                                                       ;  }
+            fi
+
+               tune2fs -o "${new_mount_options// /,}" -- "${partition}" > /dev/null  \
+            || { ret_code=$?
+                 log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                                  "when setting ${partition} mount options"
+                 log_msg ''
+                    answer="$(prompt_msg 'Do you wish to cancel the procedure?' \
+                                         '[yes]' 'no'                           )" \
+                 || return $?
+                 log_msg ''
+                 [ "${answer}" = 'yes' ] && return ${ret_code}
+                 ret_code=0                                                        ; }
+        fi
+
+        if [ -n "${extended_mount_options}" ]; then
+            bad_option="$(  tune2fs -E mount_opts="${extended_mount_options// /,}"      \
+                                    -- "${partition}"                              2>&1 \
+                          | sed -n '/Bad options specified/{p;q}'                       )"
+            ret_code=$?
+
+               [ -n "${bad_option}" ]                                                    \
+            && { log_msg -p warning "More than one extended mount option detected in"  \
+                                    "${partition} and tune2fs is unable to parse them"
+                 log_msg ''
+                 log_msg -p warning "Writing them in ${partition} superblock separated" \
+                                    "by spaces instead of comas"
+                 log_msg ''
+                 log_msg -p warning "Note that EXT4-fs will complain about unrecognized" \
+                                    "options when mounting the partition"
+                 log_msg ''
+                 log_msg -p warning "Please review them to remove this and EXT4-fs" \
+                                    "warnings"
+                 log_msg ''
+
+                 tune2fs -E mount_opts="${extended_mount_options}" -- "${partition}" \
+                                                                          >/dev/null
+                 ret_code=$?                                                         ;   }
+
+               [ ${ret_code} -ne 0 ]                                             \
+            && { log_msg -p error "tune2fs failed with error code ${ret_code}" \
+                                  "when changing ${partition} mount options"
+                 return ${ret_code}                                            ; }
+        fi
+
+        if [ ${ret_code} -eq 0 ]; then
+            log_msg "${partition} was formatted successfully!"
+        else
+            log_msg -p warning "There was an error when formatting ${partition}"
+            break
+        fi
+    done
+
+    log_msg ''
+
+    if [ ${ret_code} -eq 0 ]; then
+        log_msg "${device} partitions were formatted successfully"
+    else
+        log_msg "Some ${device} partitions had errors when formatting"
+    fi
+
+    echo "${device}"
+
+    return ${ret_code}
+}
+
+# +---------------------------------------------------------------------
+# Inputs
+#    - device
+#    - partition_root
+# +---------------------------------------------------------------------
+restore_device() {
+    local         device="$1"
+    local partition_root="$2"
+
+    local      partition=''
+    local      mounpoint=''
+    local       tar_file=''
+    local   extract_path=''
+
+    local         answer=''
+    local       ret_code=0
+
+    log_msg "Restoring ${device} data"
+    log_msg ''
+
+    partition="${device}1"
+
+    reload_disks || return $?
+
+    while :; do
+        log_msg ''
+           mountpoint="$(wait_partition_mountpoint "${partition}")"   \
+        || { ret_code=$?
+             log_msg ''
+                answer="$(prompt_msg 'Do you wish to try again?' \
+                                     '[yes]' 'no'                )" \
+             || return $?
+
+             [ "${answer}" = 'no' ] && return ${ret_code}
+
+             reload_disks || return $?
+
+             ret_code=0
+             continue                                               ; }
+        break
+    done
+
+    for tar_file in "${tmp_tars}/"*; do
+        [ ! -e "${tar_file}" ] && continue
+
+        log_msg ''
+        log_msg "Restoring ${tar_file}"
+
+        extract_path="${tar_file##*/}"
+        extract_path="${mountpoint}/${extract_path%.tar.gz}"
+
+        while :; do
+               mkdir -- "${extract_path}"                                                \
+            || { ret_code=$?
+                 log_msg ''
+                 log_msg -p error "mkdir failed with error code ${ret_code}" \
+                                  "when creating the folder ${extract_path}"
+                 log_msg ''
+
+                    grep -q -- " ${mountpoint}\>" "${mtab}"                              \
+                 || { log_msg -p warning "Nothing is mounted into ${mountpoint}"
+                      log_msg ''
+                         answer="$(prompt_msg 'Do you want to try mounting' \
+                                              "${partition} again?"         \
+                                              '[yes]' 'no'                  )" \
+                      || return $?
+
+                      log_msg ''
+                         [ "${answer}" = 'no' ]                         \
+                      && { log_msg -p error "Cannot continue without" \
+                                            "${mountpoint}"
+                           return ${ret_code}                         ; }
+                      ret_code=0
+
+                      reload_disks || return $?
+                      while :; do
+                          log_msg ''
+                             mountpoint="$(wait_partition_mountpoint "${partition}")"   \
+                          || { ret_code=$?
+                               log_msg ''
+                                  answer="$(prompt_msg 'Do you wish to try again?' \
+                                                       '[yes]' 'no'                )" \
+                               || return $?
+
+                               [ "${answer}" = 'no' ] && return ${ret_code}
+                               ret_code=0
+                               continue                                               ; }
+                          break
+                      done
+
+                      extract_path="${mountpoint}/${extract_path%.tar.gz}"
+                      continue                                                          ;}
+
+                    answer="$(prompt_msg "Do you wish to skip restoring ${tar_file}?" \
+                                         'yes' '[no]'                                 )" \
+                 || return $?
+                 [ "${answer}" = 'yes' ] && { ret_code=0; continue; }
+
+                 log_msg ''
+                    answer="$(prompt_msg 'Do you wish to cancel the procedure?' \
+                                         'yes' '[no]'                           )" \
+                 || return $?
+                 [ "${answer}" = 'yes' ] && return ${ret_code}
+                 ret_code=0
+
+                 log_msg ''
+                 log_msg -p warning "Continuing restoring ${tar_file}" \
+                                    "into ${extract_path}"                         ;     }
+            break
+        done
+
+        log_msg ''
+
+           tar -zxf "${tar_file}" -C "${extract_path}"                             \
+        || { ret_code=$?
+             log_msg -p error "tar failed with error code ${ret_code}" \
+                              "when restoring ${tar_file}"             \
+                              "into ${extract_path}"
+             log_msg ''
+                answer="$(prompt_msg "Do you wish to try copying ${tar_file}" \
+                                     'instead?'                               \
+                                     '[yes]' 'no'                             )" \
+             || return $?
+
+             log_msg ''
+             if [ "${answer}" = 'yes' ]; then
+                 rm -rf -- "${extract_path}"
+                    cp -p -- "${tar_file}" "${mountpoint}"            \
+                 && { log_msg "${tar_file} was copied successfully"
+                      continue                                      ; }          \
+                 || { ret_code=$?
+                      log_msg -p error "cp failed with error code ${ret_code}" \
+                                       "when copying ${tar_file}"              \
+                                       "into ${mountpoint}"                    ; }
+                 log_msg ''
+             fi
+                answer="$(prompt_msg 'Do you wish to cancel the procedure?' \
+                                     'yes' '[no]'                           )" \
+             || return $?
+             [ "${answer}" = 'yes' ] && return ${ret_code}
+             ret_code=0                                                        ; }  \
+        && { if    [ "${tar_file}" = "${partition_root}" ] \
+                && [              -d "${extract_path}"   ]
+             then
+                 log_msg "Moving content from ${extract_path}"  \
+                         "into the root folder (${mountpoint})"
+
+                 # Shell expansion trick. Expand the wildcard as a parameter
+                 # to the test [] exists command. It may return 0 (the shell expanded
+                 # 1 file), 1 (the shell couldn't expand and * file doesn't exist),
+                 # and 2 (test received more than 1 file, so the shell expanded)
+                 # Another option could have been using a function as simple as:
+                 #   not_empty() { [ -e "$1" ]; }   call it with the wildcard path
+                 # Or : *; [ -e "$_" ] expanding to the noop command : and checking
+                 #                     that the last expanded item ($_) exists
+                 # $_ is not POSIX and for it to work with ash we would need to add
+                 # the -i (interactive) flag to the shebang
+                 # Unfortunately $_ does not seem to work in this version of ash
+                 # (1.25.1) inside functions but it works in later versions
+                 [                  -e    "${extract_path}/"*      ] 2> /dev/null
+                 [ $? -ne 1 ] && mv -i -- "${extract_path}/"*      "${mountpoint}"
+
+                 [                  -e    "${extract_path}/".[!.]* ] 2> /dev/null
+                 [ $? -ne 1 ] && mv -i -- "${extract_path}/".[!.]* "${mountpoint}"
+
+                 log_msg ''
+                    rmdir -- "${extract_path}" 2> /dev/null                      \
+                 || { log_msg -p warning "Keeping ${extract_path} as it still" \
+                                         "contains files"
+                      log_msg ''                                               ; }
+             fi
+             log_msg "${tar_file} restored successfully!"                        ;    }
+    done
+    log_msg ''
+    log_msg "${device} data was restored"
+
+    return ${ret_code}
+}
+
+# +---------------------------------------------------------------------
+# Inputs
+#    - device
+# +---------------------------------------------------------------------
+set_main_partition_device() {
+    local     device="$1"
+
+    local  partition="${device}1"
+    local mountpoint="$(get_partition_mountpoint "${partition}")" || return $?
+
+    local     answer=''
+    local   ret_code=0
+
+    log_msg "Setting ${partition} as the main partition"
+    log_msg ''
+
+       echo "${device}2" > "${mountpoint}/${partgrator_file}"                \
+    || { ret_code=$?
+         log_msg -p error "echo failed with error code ${ret_code}"        \
+                          "when creating ${mountpoint}/${partgrator_file}"
+         log_msg ''
+         log_msg -p warning "${partition} couldn't be set as the" \
+                            "main partition"
+         log_msg ''
+            answer="$(prompt_msg 'Do you wish to cancel the procedure?' \
+                                 'yes' '[no]'                           )" \
+         || return $?
+
+         [ "${answer}" = 'yes' ] && return ${ret_code}
+         ret_code=0
+
+         log_msg ''
+
+         log_msg "Create a file named ${partgrator_file}" \
+                 "in the root folder of ${partition} for" \
+                 "allowing partgrator to process it"
+         false                                            ;                  } \
+    && log_msg "${partition} was successfully set as the main partition"
+
+    return ${ret_code}
+}
+
+partgrator_device_wizard() {
+    local           list_devices=''
+    local                 device=''
+    local                  label=''
+
+    local             filesystem=''
+    local    filesystem_features=''
+    local        max_mount_count=''
+    local         check_interval=''
+    local        errors_behavior=''
+    local          mount_options=''
+    local extended_mount_options=''
+    local         partition_root=''
+    local   partition_attributes=''
+
+    local                  other='all'
+
+    local                    IFS=$'\n'
+
+    local                 answer=''
+
+    case "${parameters}" in
+        'install'*|*' install'*|'uninstall'*|*' uninstall'*) return 0;;
+    esac
+
+    log_msg $'\n'
+    log_msg "<Starting partgrator's device creator wizard>"
+
+    case "${parameters}" in
+        '-y'*|*' -y'*|'--y'*|*' --y'*) :;;
+        *) log_msg ''
+           log_msg "This wizard automates the process of creating a partgrator" \
+                   "compatible device (USB)"
+           log_msg ''
+           log_msg "A partgrator compatible device only uses half of its maximum" \
+                   "available size"
+           log_msg ''
+           log_msg "The chosen device's data will be saved and restored after" \
+                   "the partitioning and formatting"
+           log_msg ''
+           log_msg "Nevertheless it is recommended to backup the device's data" \
+                   "to prevent data loss"
+           log_msg $'\n'
+           log_msg "Note that it is recommended to run this wizard with the"           \
+                   "jffs scripts disabled to prevent data loss of the running scripts" \
+                   "and for having enough free RAM, though attempts will be made to"   \
+                   "stop the services and unmount the devices as cleanly as possible"
+    esac
+    log_msg $'\n'
+
+    if ! case "${parameters}" in '-y'*|'--y'*|*' -y'*|*' --y'*) false;; esac; then
+        log_msg "Proceeding making a device compatible with partgrator"
+    else
+        answer="$(prompt_msg 'Would you like to make a device' \
+                             'compatible with partgrator?'     \
+                             '[yes]' 'no'                      )"            || return $?
+        [ "${answer}" = "no" ] && return 0
+    fi
+
+    installation_started=1
+    touch -- "${migrating_file}"
+
+    list_devices="$(show_devices)"                                           || return $?
+
+    if [ -z "${list_devices}" ]; then
+        log_msg -p error   "Unable to find a device to install partgrator into"
+        log_msg -p warning "Make sure that a compatible device is connected" \
+                           "and that is listed in the /dev folder following" \
+                           "the pattern /dev/sd? (example: /dev/sda)"
+        return 20
+    fi
+
+    log_msg ''
+    device="$(get_device "${list_devices}"            )"                     || return $?
+    log_msg ''
+     label="$(get_label  "${list_devices}" "${device}")"                     || return $?
+
+    log_msg $'\n'
+    log_msg "The device ${device} will be formatted and its data will be placed" \
+            "into a new partition named ${label}"
+
+       expr "${list_devices}" : '.* '${device}': [^'$'\n'']\+' > /dev/null    \
+    && { log_msg ''
+            expr "${list_devices}" :                                        \
+                 '.* '${device}': [^'$'\n'']*('${label}')'     > /dev/null  \
+         && { log_msg "The data from the current ${label} partition will" \
+                      "be saved and restored after the format"
+              log_msg ''
+              other='other'                                               ; }
+
+         log_msg "Data from ${other} ${device} partitions will be placed" \
+                 "into folders named after them inside ${label}"
+         log_msg ''
+         log_msg "The ${other} ${device} partitions will be unmounted" \
+                 "once their data has been saved"                         ;   }
+
+    log_msg $'\n'
+
+    answer="$(prompt_msg "Do you wish to continue?" 'yes' '[no]')"           || return $?
+    [ "${answer}" = "no" ] && return 0
+
+    log_msg $'\n'
+
+    partition_attributes="$(get_partition_attributes "${list_devices}" \
+                                                     "${device}"       \
+                                                     "${label}"        )"    || return $?
+
+                filesystem="$(echo "${partition_attributes}" | cut -d'|' -f  2)"
+       filesystem_features="$(echo "${partition_attributes}" | cut -d'|' -f  4)"
+           max_mount_count="$(echo "${partition_attributes}" | cut -d'|' -f  5)"
+            check_interval="$(echo "${partition_attributes}" | cut -d'|' -f  6)"
+           errors_behavior="$(echo "${partition_attributes}" | cut -d'|' -f  7)"
+             mount_options="$(echo "${partition_attributes}" | cut -d'|' -f  8)"
+    extended_mount_options="$(echo "${partition_attributes}" | cut -d'|' -f  9)"
+            partition_root="$(echo "${partition_attributes}" | cut -d'|' -f 10)"
+
+    if [ ${max_mount_count} -le 0 ]; then
+        log_msg ''
+        log_msg -p warning "Maximum mount count is set to ${max_mount_count}"
+        log_msg -p warning "This means that this feature is disabled"
+        log_msg ''
+        log_msg -p warning "This variable determines the maximum number of times"  \
+                           "a partition has to be mounted before a full partition" \
+                           "scan is scheduled to check the partition's integrity"
+        log_msg ''
+        log_msg "You can always change its value with: tune2fs -c <value> <partition>"
+        log_msg ''
+           answer="$(prompt_msg "Do you wish to enable this recommended feature by"  \
+                                "setting its value to ${ext_max_mount_count} times?" \
+                                '[yes]' 'no'                                         )" \
+        || return $?
+
+        [ "${answer}" = 'yes' ] && max_mount_count="${ext_max_mount_count}"
+    fi
+
+    if [ ${check_interval} -le 0 ]; then
+        log_msg ''
+        log_msg -p warning "Check interval is set to ${check_interval}"
+        log_msg -p warning "This means that this feature is disabled"
+        log_msg ''
+        log_msg -p warning "This variable determines the elapsed number of days since" \
+                           "the last full partition scan before another full scan is"  \
+                           "scheduled to check the partition's integrity"
+        log_msg ''
+        log_msg "You can always change its value with: tune2fs -i <value> <partition>"
+        log_msg ''
+           answer="$(prompt_msg "Do you wish to enable this recommended feature by" \
+                                "setting its value to ${ext_check_interval} days?"  \
+                                '[yes]' 'no'                                        )" \
+        || return $?
+
+        [ "${answer}" = 'yes' ] && check_interval="${ext_check_interval}"
+    fi
+
+    if [ "${errors_behavior}" != "continue" ]; then
+        log_msg ''
+        log_msg -p warning "Errors behavior is set to ${errors_behavior}"
+        log_msg ''
+        log_msg -p warning "This variable determines how the system will react" \
+                           "when mounting a partition with errors"
+        log_msg ''
+        log_msg -p warning "Partgrator works with both 'continue', and 'remount-ro'" \
+        log_msg ''
+        log_msg -p warning "Although 'remount-ro' is a safer choice, 'continue' is"  \
+                           "the option used by default to prioritize uptime in case" \
+                           "partgrator is unable to perform a migration"
+        log_msg ''
+        log_msg "You can always change its value with: tune2fs -e <value> <partition>"
+        log_msg ''
+           answer="$(prompt_msg "Do you wish to set this variable to" \
+                                "${ext_errors_behavior}?"             \
+                                '[yes]' 'no'                          )" \
+        || return $?
+
+        [ "${answer}" = 'yes' ] && errors_behavior="${ext_errors_behavior}"
+    fi
+
+    log_msg $'\n'
+    log_msg "partgrator will be installed in the device: ${device}"
+    log_msg "The main partition will be called: ${label}"
+    log_msg "The filesystem will be: ${filesystem}"
+
+    [ -n "${filesystem_features}"    ] && log_msg "The filesystem features"  "will be:" \
+                                                  "${filesystem_features}"
+
+    log_msg "The max mount count will be: ${max_mount_count}"
+    log_msg "The check interval will be: ${check_interval}"
+    log_msg "The errors behavior will be: ${errors_behavior}"
+
+    [ -n "${mount_options}"          ] && log_msg "The mount options"        "will be:" \
+                                                  "${mount_options}"
+    [ -n "${extended_mount_options}" ] && log_msg "The extended mount options will be:" \
+                                                  "${extended_mount_options}"
+
+    log_msg $'\n'
+    log_msg "The formatting and data saving+restoring will begin"
+    log_msg "Note that this process may take a while"
+    log_msg $'\n'
+
+    answer="$(prompt_msg 'Are you sure you wish to continue?' 'yes' '[no]')" || return $?
+    [ "${answer}" = 'no' ] && return 0
+
+    log_msg $'\n'
+
+    analyze_tmp                                                              || return $?
+
+    partition_root="$(process_partitions "${list_devices}"  \
+                                         "${device}"        \
+                                         "${partition_root}")"               || return $?
+    log_msg $'\n'
+
+    eject_device "${device}"                                                 || return $?
+    log_msg $'\n'
+
+    wait_device_prompt "${device}"                                           || return $?
+    log_msg $'\n'
+
+    device="$(partition_device "${device}")"                                 || return $?
+    log_msg $'\n'
+
+    # Ejecting the device again to try prevent the partitions
+    # from auto-mounting after reloading the table
+    # TODO - Not sure if the return on error should be removed
+    eject_device "${device}"                                                 || return $?
+    log_msg $'\n'
+
+    wait_device_prompt "${device}"                                           || return $?
+    log_msg $'\n'
+
+    device="$(format_device    "${device}"                 \
+                               "${filesystem}"             \
+                               "${label}"                  \
+                               "${filesystem_features}"    \
+                               "${max_mount_count}"        \
+                               "${check_interval}"         \
+                               "${errors_behavior}"        \
+                               "${mount_options}"          \
+                               "${extended_mount_options}" )"                || return $?
+    log_msg $'\n'
+
+    restore_device "${device}" "${partition_root}"                           || return $?
+    log_msg $'\n'
+
+    set_main_partition_device  "${device}"                                   || return $?
+    log_msg $'\n'
+
+    log_msg "Flushing buffered data into ${device}"
+    sync
+    log_msg $'\n'
+
+    log_msg "${device} data restoring procedure completed"
+    log_msg ''
+    log_msg "Device ${device} was configured successfully!"
+
+    installation_started=0
+
+    log_msg $'\n'
+    unmount_device_partitions   "${device}"                                  || return $?
+
+    log_msg $'\n'
+    eject_device                "${device}"                                  || return $?
+
+    log_msg $'\n'
+    reload_disks                                                             || return $?
+
+    log_msg $'\n'
+    start_services                                                           || return $?
+
+    return 0
+}
+
+clean_tmp() {
+    local   analyze="$1"
+
+    local begin_msg=''
+    local   end_msg=''
+    local  warn_msg=''
+
+    [ ! -d "${tmp_tars}" ] && return 0
+
+    if [ -z "${analyze}" ]; then
+        begin_msg="Cleaning ${tmp_tars}"
+          end_msg="Finished cleaning up"
+         warn_msg="There is some data remaining from the backup process"
+         warn_msg="${warn_msg} in ${tmp_tars} that can be used if you re-run"
+         warn_msg="${warn_msg} this installer"
+    else
+        begin_msg="Analyzing ${tmp_tars}"
+          end_msg="Finished analyzing"
+         warn_msg="There is some data remaining from the previous backup process"
+         warn_msg="${warn_msg} in ${tmp_tars} that will be saved into the device"
+         warn_msg="${warn_msg} if preserved"
+    fi
+
+    log_msg "${begin_msg}"
+    log_msg ''
+
+    if    [       ${installation_started}    -ne 0                    ] \
+       && { [ -e "${tmp_tars}/"*.tar.gz ] 2> /dev/null; [ $? -ne 1 ]; }
+    then
+        # ^ Shell expansion trick. Expand the wildcard as a parameter
+        # to the test [] exists command. It may return 0 (the shell expanded
+        # 1 file), 1 (the shell couldn't expand and * file doesn't exist),
+        # and 2 (test received more than 1 file, so the shell expanded)
+        # Another option could have been using a function as simple as:
+        #   not_empty() { [ -e "$1" ]; }   call it with the wildcard path
+        # Or : *; [ -e "$_" ] expanding to the noop command : and checking
+        #                     that the last expanded item ($_) exists
+        # $_ is not POSIX and for it to work with ash we would need to add
+        # the -i (interactive) flag to the shebang
+        # Unfortunately $_ does not seem to work in this version of ash
+        # (1.25.1) inside functions but it works in later versions
+
+        log_msg -p warning "${warn_msg}"
+        log_msg ''
+
+            answer="$(prompt_msg 'Do you wish to preserve it?' \
+                                 '[yes]' 'no'                  )" \
+        || return $?
+
+        log_msg ''
+        [ "${answer}" = 'yes' ] && return ${tar_preserve_code}
+    fi
+
+    rm -rf -- "${tmp_tars}"
+
+    log_msg "${end_msg}"
+    log_msg ''
+
+    return 0
+}
+
+clean_tmp_installer() {
+    local ret_code=0
+
+    if    [ "${installer%.tmp}"  = "${tmp_installer%.tmp}"   ] \
+       && [ "${installer}"      != "${partgrator_installer}" ]
+    then
+        log_msg -p warning "Removing ${installer}"
+        log_msg ''
+        log_msg -p warning "Find the installer installed in ${partgrator_installer}"
+        log_msg ''
+
+           rm "${installer}"                                             \
+        || { ret_code=$?
+             log_msg -p error "rm failed with error code ${ret_code}"  \
+                              "when trying to remove ${installer}"
+             return ${ret_code}                                        ; }
+        sync
+    fi
+
+    return 0
+}
+
+graceful_exit() {
+    local ret_code=0
+
+    trap - EXIT KILL QUIT INT
+
+    if [ ${installation_started} -ne 0 ]; then
+        log_msg ''
+        log_msg -p warning "Cancelling procedure"
+        log_msg ''
+    fi
+    restore_backup_scripts                        || ret_code=$?
+    log_msg ''
+    clean_tmp                                     || ret_code=$?
+
+    rm -f -- "${migrating_file}"
+
+    clean_tmp_installer                           || ret_code=$?
+    log_msg "Exiting"
+    exit ${ret_code}
+}
+
+interrupt_exit() {
+    local ret_code=1
+
+    trap - EXIT KILL QUIT INT
+
+    log_msg $'\n'
+    log_msg -p warning "Operation interrupted"
+
+    restore_backup_scripts                     || ret_code=$?
+    log_msg ''
+    clean_tmp                                  || ret_code=$?
+
+    rm -f -- "${migrating_file}"
+
+    clean_tmp_installer                        || ret_code=$?
+    log_msg -p warning "Exiting"
+    exit ${ret_code}
+}
+
+
+############## PRE-INIT ##############
+
+   mkdir -p -- "${tmp}"                                            \
+|| { ret_code=$?
+     log_msg -p error "mkdir failed with error code ${ret_code}" \
+                      "when trying to create ${tmp}"
+     exit ${ret_code}                                            ; }
+
+check_tools "${pre_init_tools_needed}" || exit $?
+
+   case "${parameters## }" in *'install'*|*'usb-creator'*|'-y'*|'--y'*|'') false;; esac \
+&& { partgrator_help
+     exit $?                                                                          ; }
+
+log_msg ''
+relaunch_from_memory || exit $?
+
+
+########### SOURCE INCLUDE ###########
+
+partgrator_banner    || exit $?
+log_msg $'\n'
+log_msg "[Preparation phase]"
+
+setup_downloader     || exit $?
+
+log_msg $'\n'
+
+helpers_tools_check='no' # Prevent helper tools from auto-check (will be checked later)
+if [ ! -f "${partgrator_helpers}" ]; then
+    log_msg "Partgrator helpers not found, downloading them"
+    log_msg ''
+    downloader "${partgrator_helpers_link}" "${tmp_helpers}" || exit
+
+    . "${tmp_helpers}"
+else
+    log_msg "Found partgrator helpers in ${partgrator_helpers}, using them"
+
+    . "${partgrator_helpers}"
+fi
+
+
+############## CLEANUP ###############
+
+trap 'interrupt_exit' KILL QUIT INT
+trap  'graceful_exit' EXIT
+
+
+############### MAIN #################
+
+partgrator_check_tools    || exit $?
+partgrator_recovery       || exit $?
+partgrator_scripts_wizard || exit $?
+partgrator_device_wizard  || exit $?
+
+
+# EOF

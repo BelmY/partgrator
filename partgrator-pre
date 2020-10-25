@@ -1,0 +1,318 @@
+#!/bin/sh
+
+# partgrator-pre version 1.0.0
+#
+# partgrator-pre truncates logfiles, cleans mountpoints, and wraps disk-check tools
+#
+# For more information, issues, or assistance visit: https://github.com/caribpa/partgrator
+#
+# Author: caribpa (https://github.com/caribpa)
+#
+# Copyright 2020 caribpa
+#
+# partgrator-pre is free to use under the Artistic License 2.0
+#
+# Find the Artistic License 2.0 here: https://spdx.org/licenses/Artistic-2.0.html
+
+
+########### USER VARIABLES ###########
+
+partgrator_dir="/jffs/addons/partgrator"    # Partgrator installation directory path
+
+  logfile_truncate_lines=500  # Lines to remain on ${logfile} after being truncated
+logfile_truncate_minutes=30   # Minutes for truncating ${logfile} since last modification
+
+ process_tools="e2fsck"       # disk-check tools whose return code will be processed by
+                              # partgrator and a migration will be scheduled if needed
+                              # Note that the tool name can only contain characters
+                              # considered valid as function names
+
+  mount_folder="/tmp/mnt"     # Absolute path to the folder where the partitions are
+                              # automatically mounted
+
+
+######################################
+###                               ####
+###  USERS DO NOT NEED TO MODIFY  ####
+###       BELOW THIS POINT        ####
+###                               ####
+######################################
+
+
+######### GENERAL VARIABLES ##########
+
+tools_needed="[
+              awk
+              blkid
+              date
+              echo
+              expr
+              false
+              grep
+              rm
+              sed
+              rmdir
+              tail
+              type
+              wc
+              ${process_tools}"
+
+
+########### SOURCE INCLUDE ###########
+
+log_tag="partgrator-pre"            # Tag used as prefix when logging messages
+
+helpers_tools_check="no"
+. "${partgrator_dir}/helpers"
+
+logfile_last_modified="$(LC_ALL=C                             ; \
+                           PATH=/sbin:/bin:/usr/sbin:/usr/bin ; \
+                         date -r "${logfile}" +%s 2> /dev/null  )"
+
+helpers_tools_check="yes"
+check_helpers_tools || exit $?
+
+
+########### PREREQUISITES ############
+
+log_msg "Initializing partgrator-pre script"
+
+check_tools "${tools_needed}" \
+                              \
+                              \
+&& ( # Beginning of main subshell - Beginning of check_tools conditional execution
+
+########### SHELL VARIABLES ##########
+
+    LC_ALL=C
+      PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+
+########## GLOBAL VARIABLES ##########
+
+ partition="$1"
+filesystem="$2"
+
+
+############## HELPERS ###############
+
+truncate_logfile() {
+    local          current_time="$(awk 'BEGIN{srand(); print srand()}')"   || return $?
+    local logfile_current_lines="$(wc -l "${logfile}")"                    || return $?
+    local    seconds_difference=$(expr ${current_time} - ${logfile_last_modified:-0})
+    local              ret_code=0
+
+    if    [                           -n "${logfile_last_modified}"           ] \
+       && [                           -n "${logfile_truncate_minutes}"        ] \
+       && [ ${seconds_difference#-}   -gt $((logfile_truncate_minutes \* 60)) ] \
+       && [ ${logfile_truncate_lines} -le ${logfile_current_lines%% *}        ]
+    then
+        log_msg "Truncating logfile ${logfile} to the last" \
+                "${logfile_truncate_lines} lines"
+
+        echo "$(tail -n -${logfile_truncate_lines} "${logfile}")" > "${logfile}"
+        ret_code=$?
+
+        if [ ${ret_code} -ne 0 ]; then
+            log_msg -p error "echo failed with error code ${ret_code} when" \
+                             "truncating ${logfile}"
+        else
+            log_msg "${logfile} truncated successfully"
+        fi
+    fi
+    return ${ret_code}
+}
+
+# Automatically remove previously existing mountpoint folders
+clean_partition_mountpoint() {
+    local   partition="$1"
+
+    local       label=''
+    local  mountpoint=''
+    local mountpoints=''
+
+    local    ret_code=0
+
+    label="$(get_partition_label "${partition}")" || return $?
+
+    log_msg "Starting partition mountpoint cleaner"
+
+     mountpoint="${mount_folder}/${label//[ \"\']/_}"   # Replace problematic symbols
+    mountpoints="${mountpoint}*"                        # Shell expansion for-loop
+
+    log_msg "Checking if ${partition} mountpoint (${mountpoint})" \
+            "needs to be cleaned before being mounted"
+
+    if grep -q "^${partition} " "${mtab}"; then
+        log_msg -p warning "${partition} seems to be mounted"
+        log_msg -p warning "Not cleaning ${mountpoint} folder"
+        return 0
+    fi
+
+    # The shell expansion is needed to catch folders with numbers prefixed due to
+    # bad unmounting or missed cleanup
+    for mountpoint in ${mountpoints}; do
+        if      [ -d "${mountpoint}" ]              \
+           && ! grep -q " ${mountpoint} " "${mtab}"
+        then
+            log_msg "Cleaning ${mountpoint}"
+
+            rm -f -- "${mountpoint}/.autocreated-dir"
+            rmdir -- "${mountpoint}"
+            ret_code=$?
+            if [ ${ret_code} -eq 0 ]; then
+                log_msg "${mountpoint} was successfully cleaned"
+            else
+                log_msg -p error   "rmdir failed with error code ${ret_code}" \
+                                   "when trying to remove ${mountpoint}"
+                log_msg -p warning "Continuing without cleaning the" \
+                                   "previous mountpoint folder"
+            fi
+        fi
+    done
+
+    log_msg "Finishing partition mountpoint cleaner"
+
+    return ${ret_code}
+}
+
+
+############### MAIN #################
+
+log_msg "Starting with ${partition} and ${filesystem} as parameters"
+
+truncate_logfile
+
+clean_partition_mountpoint "${partition}"
+
+# End of main subshell - Comment redirection for debugging
+) > /dev/null 2> /dev/null \
+                           \
+&& {              # All the following will only be executed if the subshell succeeded
+
+
+########## EXPORTED HELPERS ##########
+
+override_tool() {
+    local tool_name="$1"
+    local tool_path="$(LC_ALL=C type "${tool_name}" 2>&1)"
+    local  ret_code=0
+
+    log_msg "Overriding tool ${tool_name}"
+
+    if [ ! -e "${tool_path##* }" ]; then
+        log_msg -p error "Unable to override ${tool_name} as it${tool_path#${tool_name}}"
+        return 1
+    fi
+
+    tool_path="${tool_path##* }"
+
+    eval "${tool_name}"'() {
+              local       params="$@"
+
+              local    partition="${params##* }"
+
+              local file_content=""
+              local    blkid_out=""
+              local        label=""
+
+              local     ret_code=0
+
+              # Return early if the partition is already mounted
+              grep -q "^${partition} " "'"${mtab}"'" && return 0
+
+              blkid_out="$(blkid "${partition}" 2> /dev/null)" || return $?
+
+              if expr "${blkid_out}" : "${partition}: LABEL=" > /dev/null; then
+                  # Partition has a label
+                  # Trim everything around the first and last double-quotes of the label
+                  label="${blkid_out#*=\"}"
+                  label="${label%\" *}"
+              else
+                  # Partition has no label so assign as label the partition device
+                  # (device name + partition number)
+                  label="${partition##*\/}"
+              fi
+
+              # The tool should only be run for non-${partgrator_label} partitions
+                 ! case "${label}" in '"${partgrator_label}"'*) false;; esac \
+              || '"${tool_path}"' ${params}
+              ret_code=$?
+
+              # Write the status only if a migration is not in progress
+              if [ ! -f "'"${migrating_file}"'" ]; then
+                  # Delete the previous entry
+                     [ -f "'"${partitions_status}"'" ]                  \
+                  && file_content="$(sed "/^"${partition//\//\\\/}" /d" \
+                                         "'"${partitions_status}"'"     )"
+
+                  # The newline can be used without a variable because of eval
+                  echo "${file_content}${file_content:+'$'\n''}${partition}" \
+                                                              "${ret_code}"  \
+                                                             ":${label}"     \
+                       > "'"${partitions_status}"'"
+              fi
+
+              # Prematurely exit pre-mount for ${partgrator_label} partitions
+                 [ "'"${partgrator_pre_mount}"'" = "0" ]                     \
+              && ! case "${label}" in '"${partgrator_label}"'*) false;; esac \
+              && exit ${ret_code}
+
+              return ${ret_code}
+          }                                                                              '
+    ret_code=$?
+
+    if [ ${ret_code} -ne 0 ]; then
+        log_msg -p error "eval failed with error code ${ret_code} when" \
+                         "trying to override tool ${tool_name}"
+    else
+        log_msg "Tool ${tool_name} was overridden successfully"
+    fi
+
+    return ${ret_code}
+}
+
+
+########### EXPORTED MAIN ############
+
+log_msg "Starting overriding tools for processing" \
+        "their exit code when executed"
+
+for tool in ${process_tools}; do
+    override_tool "${tool}"
+done
+
+log_msg "Finished overriding tools"
+
+
+####### UNSET EXPORTED HELPERS #######
+
+unset -f override_tool
+
+
+}  # End of the check_tools conditional execution
+
+log_msg "Exiting"
+
+
+####### UNSET GENERAL HELPERS ########
+
+unset_helpers  # log_tag and helpers_tools_check are unset here
+
+
+###### UNSET GENERAL VARIABLES #######
+
+unset -v tools_needed          \
+         logfile_last_modified
+
+
+######## UNSET USER VARIABLES ########
+
+unset -v partgrator_dir           \
+         logfile_truncate_lines   \
+         logfile_truncate_minutes \
+         process_tools            \
+         mount_folder
+
+
+# EOF
