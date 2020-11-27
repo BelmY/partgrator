@@ -8,6 +8,7 @@
   - [[#User-scripts][User scripts]]
   - [[#Customization][Customization]]
   - [[#Known-issues-and-limitations][Known issues and limitations]]
+  - [[#Forum-and-Assistance][Forum and Assistance]]
   - [[#Troubleshooting][Troubleshooting]]
   - [[#How-it-works][How it works]]
   - [[#Why-it-works][Why it works]]
@@ -679,6 +680,13 @@
   - The /External USB disk status/ in the ASUS web UI may appear in red or show incorrect/incomplete information and/or features (such as not displaying the ASUS /Download Master/ quick access button even though it is usable and accessible by URL or under the general /USB Application/ tab) in the tab if the first partition that was mounted happened to be the partgrator partition. There is no workaround available as the mount ordering of the partitions is not guaranteed (meaning: it's not guaranteed that /dev/sda1 is always mounted first)
   - It's not possible to set multiple extended mount options with ~tune2fs -E mount_opts=<coma separated extended mount options quoted string>~ due to the conflicting parsing mechanism implemented in tune2fs ([[https://serverfault.com/a/944433][reference]]). ~debugfs~ can be used as a workaround but it is not available on Asuswrt-Merlin. When multiple extended mount options are detected, they are written into the partition's [[https://www.kernel.org/doc/html/latest/filesystems/ext4/globals.html#super-block][superblock]] separated by spaces, and a warning is issued
 
+* Forum and Assistance
+  Partgrator has its own thread in [[https://www.snbforums.com/threads/partgrator-automated-data-migrations-on-ext-fs-corruption.67997][SNBForums]].
+
+  Please use it as first option if the [[#Troubleshooting][troubleshooting]] doesn't cover your issue and/or you require any assistance or want to discuss features, behavior, issues, etc.
+
+  As a last resort or if the problem discussed in the forum has to be formalized, please open an [[https://github.com/caribpa/partgrator/issues][issue]].
+
 * Troubleshooting
 ** Out of RAM when creating a device with the usb-creator wizard
    If there are swapfiles in your device, check [[#Partgrator-scripts-and-installer-is-unable-to-unmount-my-device-USB][unable to unmount my device]] for a permanent solution.
@@ -740,7 +748,7 @@
 
    You may find the installation procedure output in the file ~/tmp/partgrator.log~ (or whatever path the variable ~$logfile~ is set to).
 
-   For better assistance, attach your ~partgrator.log~ when creating an [[https://github.com/caribpa/partgrator/issues][issue]] with the title set to /[Installer issue]/ + keywords of the issue.
+   For better assistance, attach your ~partgrator.log~ when writing in [[https://www.snbforums.com/threads/partgrator-automated-data-migrations-on-ext-fs-corruption.67997][SNBForums]], and, as a last resort, open an [[https://github.com/caribpa/partgrator/issues][issue]] with the title set to /[Installer issue]/ + keywords of the problem.
 
 ** Partgrator scripts are not working / Other scripts issues
    Make sure that the [[#Requisites][requisites]] are met, a Partgrator-ready device is detected by the system, and that a ~.partgrator~ file is placed in the root folder of your main partition.
@@ -749,7 +757,7 @@
 
    If you are unable to find partgrator check the content of the file ~/jffs/addons/partgrator.log~ for errors (or whatever path the environment variable ~$logfile~ or the script variable ~$default_logfile~ is set to).
 
-   If you are still unable to make partgrator scripts work, please open an [[https://github.com/caribpa/partgrator/issues][issue]] (attach/upload your ~partgrator.log~ for better assistance) with the title set to /[Script issue]/ + keywords of the issue.
+   If you are still unable to make partgrator scripts work, please write in [[https://www.snbforums.com/threads/partgrator-automated-data-migrations-on-ext-fs-corruption.67997][SNBForums]], and as a last resort open an [[https://github.com/caribpa/partgrator/issues][issue]] (attach/upload your ~partgrator.log~ for better assistance) with the title set to /[Script issue]/ + keywords of the problem.
 
 * How it works
 ** Setup
